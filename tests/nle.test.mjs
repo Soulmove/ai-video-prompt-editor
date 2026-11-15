@@ -4,13 +4,26 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { NLE_SQUARE_TEMPLATES, GROUPS } from '../dist/nle-catalog.mjs';
+import { NLE_SQUARE_TEMPLATES, GROUPS, CHARACTER_FIELDS } from '../dist/nle-catalog.mjs';
 import { renderOptionSwatch } from '../dist/nle-swatches.mjs';
 import { ICON_IDS, uiIcon } from '../dist/nle-icons.mjs';
 
 import {
  createBlankProject,
  createDemoProject,
+ cloneProject,
+ hasProjectContent,
+ hasExportableClips,
+ advancePlayhead,
+ displayAspectLabel,
+ displayResolutionLabel,
+ parseCustomResolution,
+ parseCustomNegativeTags,
+ addExtraTrack,
+ removeExtraTrack,
+ deleteClips,
+ batchUpdateClipDuration,
+ createBlankTemplateJson,
  addClip,
  addPresetClip,
  splitClipAt,
@@ -253,4 +266,135 @@ test('Lucide linear SVG icon pack covers all UI references and replaces emoji gl
  assert.deepEqual(appJs.match(emojiRe), null);
  assert.deepEqual(modelJs.match(emojiRe), null);
  assert.deepEqual(indexHtml.match(emojiRe), null);
+});
+
+test('advancePlayhead progresses continuously at 60Hz without zero-quantization stalling', () => {
+ let t = 0;
+ let ended = false;
+ for (let i = 0; i < 60; i++) {
+  const step = advancePlayhead(t, 0.016, 12);
+  t = step.time;
+  ended = step.ended;
+ }
+ assert.ok(t > 0.9 && t < 1.1, `Expected ~0.96s after 60 frames, got ${t}`);
+ assert.equal(ended, false);
+
+ const tail = advancePlayhead(11.98, 0.05, 12);
+ assert.equal(tail.time, 12);
+ assert.equal(tail.ended, true);
+});
+
+test('custom aspect ratio, resolution labels, and custom negative keywords localize and format cleanly', () => {
+ const p = createBlankProject({ format: 'custom', resolution: 'custom', customAspect: '', customResolution: '' });
+ assert.equal(displayAspectLabel(p, 'zh'), '自定义比例');
+ assert.equal(displayResolutionLabel(p, 'zh'), '自定义像素');
+ assert.ok(!displayResolutionLabel(p, 'zh').includes('Custom'));
+
+ p.customAspect = '21:9';
+ p.customResolution = '2560x1080';
+ assert.equal(displayAspectLabel(p, 'zh'), '21:9');
+ assert.equal(displayResolutionLabel(p, 'zh'), '2560x1080');
+ assert.deepEqual(parseCustomResolution('2560x1080'), { w: 2560, h: 1080, label: '2560x1080', valid: true });
+ assert.deepEqual(parseCustomNegativeTags('面部变形, 多余手指；文字乱码, 面部变形'), ['面部变形', '多余手指', '文字乱码']);
+});
+
+test('non-primary addClip avoids silent stacking while explicit atStart preserves exact audio timing', () => {
+ const p = createBlankProject();
+ const first = addClip(p, 'dialogue', { speakerName: '林晚', text: '雨好像要停了。', duration: 3 });
+ const second = addClip(p, 'dialogue', { speakerName: '陈默', text: '快看天边。', duration: 2.5 });
+ assert.equal(first.clip.start, 0);
+ assert.equal(second.clip.start, 3);
+ assert.equal(second.shifted, true);
+
+ // Explicit audio timing like 0-5s rain & 12-20s footsteps
+ const rain = addClip(p, 'audio', { kind: 'ambience', cue: '细雨打在伞面', duration: 5, fadeIn: 0.4 }, { atStart: 0 });
+ const steps = addClip(p, 'audio', { kind: 'sfx', cue: '由远及近脚步声', duration: 8, fadeOut: 0.5 }, { atStart: 12 });
+ assert.equal(rain.clip.start, 0);
+ assert.equal(steps.clip.start, 12);
+});
+
+test('short film workflow: transitions (cut=0s & transitionOut), props, sunrise light, audio start & subtitle styling export once', () => {
+ const p = createBlankProject({
+  title: '雨停之前',
+  format: '9:16',
+  resolution: '1080P',
+  fps: 24,
+  negativePrompts: ['identity', 'face_deform', 'skin', 'hands', 'warp'],
+  customNegative: '过曝路灯'
+ });
+ p.characters.push({ id: 'c-chen', name: '陈默', face: '方脸', eyes: '单眼皮', lockIdentity: true });
+ p.scenes.push({ id: 's-roof', name: '天台', description: '城市旧楼天台', time: 'sunrise', lightSource: 'morning_sun' });
+ p.scenes.push({ id: 's-unused', name: '天桥', description: '备用过街天桥' });
+
+ const s1 = addClip(p, 'video', { title: '分镜 01', duration: 5, sceneId: 's-roof', characterIds: ['c-chen'], props: '热豆浆纸杯、透明雨伞', prompt: '陈默递出豆浆' });
+ const s2 = addClip(p, 'video', { title: '分镜 02', duration: 5, transitionIn: 'cut', transitionOut: 'fade_out', transitionOutDur: 0.8, prompt: '两人望向日出晨光' });
+ assert.equal(s1.clip.transitionDur, 0);
+ assert.equal(s2.clip.transitionDur, 0);
+ assert.equal(s2.clip.transitionOutDur, 0.8);
+
+ addClip(p, 'dialogue', { start: 3, duration: 4, speakerName: '林晚', text: '“你一直都在等吗？”', subtitlePos: 'top', subtitleStyle: '电影白字细黑边' });
+ addClip(p, 'audio', { start: 0, duration: 5, kind: 'ambience', cue: '细密晨雨声', fadeIn: 0.5 });
+ addClip(p, 'audio', { start: 12, duration: 3, kind: 'sfx', cue: '天台远处车流声', spatial: '远处画外' });
+ addClip(p, 'bgm', { start: 2, duration: 13, style: 'solo_piano', mood: '克制希望' });
+
+ const out = compileTimelinePrompt(p, 'storyboard', 'zh');
+ assert.match(out, /关键道具：热豆浆纸杯、透明雨伞/);
+ assert.match(out, /入画转场：硬切 \(Hard Cut\).*\(0s\)/);
+ assert.match(out, /出画转场：淡出（Fade Out）.*\(0\.8s\)/);
+ assert.match(out, /独奏钢琴旋律/);
+ assert.match(out, /面部五官扭曲变形/);
+ assert.match(out, /过曝路灯/);
+ assert.match(out, /00:12\.0-00:15\.0.*天台远处车流声/);
+ // Ensure dialogue crossing Shot 1 -> Shot 2 only appears ONCE in storyboard export
+ assert.equal(out.match(/“你一直都在等吗？”/g)?.length, 1);
+
+ const issues = validateTimeline(p);
+ assert.ok(issues.some((i) => i.message.includes('天桥') && i.message.includes('尚未绑定')));
+ assert.ok(GROUPS.negative.options.some((o) => o.id === 'face_deform'));
+ assert.ok(GROUPS.time.options.some((o) => o.id === 'sunrise'));
+ assert.ok(GROUPS.lightSource.options.some((o) => o.id === 'morning_sun'));
+
+ const labels = CHARACTER_FIELDS.map(([, label]) => label);
+ assert.equal(new Set(labels).size, labels.length);
+});
+
+test('import error messages use clear Chinese diagnostics and blank templates roundtrip cleanly', () => {
+ assert.throws(() => parseAnyProjectImport('   '), /导入内容为空/);
+ assert.throws(() => parseAnyProjectImport('not json'), /JSON 格式解析失败/);
+ assert.throws(() => parseAnyProjectImport('{"hello":1}'), /未能识别的工程格式/);
+
+ const tplV1 = createBlankTemplateJson('v1');
+ const p1 = parseAnyProjectImport(tplV1);
+ assert.equal(p1.tracks.video.length, 1);
+
+ const tplV2 = createBlankTemplateJson('v2');
+ const p2 = parseAnyProjectImport(tplV2);
+ assert.equal(hasExportableClips(p2), false);
+});
+
+test('extra tracks, track lock/mute/hide, cloneProject, and batch edit operations work cleanly', () => {
+ const p = createBlankProject({ title: '测试工程' });
+ const { track: v2 } = addExtraTrack(p, 'video');
+ assert.equal(v2.code, 'V2');
+ const a1 = addClip(p, 'video', { title: 'A', duration: 3 }).clip;
+ const a2 = addClip(p, 'video', { title: 'B', duration: 4 }).clip;
+ const pip = addClip(p, v2.key, { title: '画中画', duration: 3 }, { atStart: 1 }).clip;
+ assert.equal(hasProjectContent(p), true);
+
+ // Lock V2 and verify batchDelete skips locked track while deleting unlocked items
+ p.trackMeta[v2.key] = { locked: true };
+ batchUpdateClipDuration(p, [{ track: 'video', id: a1.id }, { track: v2.key, id: pip.id }], 6);
+ assert.equal(p.tracks.video[0].duration, 6);
+ assert.equal(p.tracks[v2.key][0].duration, 3);
+
+ const delRes = deleteClips(p, [{ track: 'video', id: a2.id }, { track: v2.key, id: pip.id }]);
+ assert.equal(delRes.deletedCount, 1);
+ assert.equal(p.tracks[v2.key].length, 1);
+
+ const cloned = cloneProject(p);
+ assert.notEqual(cloned.id, p.id);
+ assert.match(cloned.title, /副本/);
+
+ assert.equal(removeExtraTrack(p, 'video').ok, false);
+ assert.equal(removeExtraTrack(p, v2.key).ok, true);
 });

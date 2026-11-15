@@ -21,10 +21,28 @@ import {
  fmtTimecode,
  fmtFramesTimecode,
  aspectRatioParts,
+ parseCustomResolution,
+ displayAspectLabel,
+ displayResolutionLabel,
+ parseCustomNegativeTags,
+ getAllTracks,
+ trackKind,
+ addExtraTrack,
+ removeExtraTrack,
+ isTrackLocked,
+ isTrackHidden,
+ isTrackMuted,
+ advancePlayhead,
  groupOptions,
+ groupItem,
  groupLabel,
  createBlankProject,
  createDemoProject,
+ cloneProject,
+ hasProjectContent,
+ hasExportableClips,
+ countProjectClips,
+ createBlankTemplateJson,
  parseAnyProjectImport,
  projectDuration,
  addClip,
@@ -33,6 +51,8 @@ import {
  moveClip,
  trimClip,
  deleteClip,
+ deleteClips,
+ batchUpdateClipDuration,
  duplicateClip,
  normalizeAllTracks,
  stateAtTime,
@@ -44,7 +64,11 @@ import {
  saveProject,
  loadProject,
  listProjects,
+ listTrashedProjects,
+ softDeleteProject,
+ restoreProject,
  deleteProject,
+ emptyTrash,
  clearProjects,
  readPrefs,
  savePrefs,
@@ -79,24 +103,29 @@ const TRACK_ICON_MAP = {
 const appState = {
  screen: 'home',         // 'home' | 'editor'
  homeTab: 'home',        // 'home' | 'square' | 'cloud'
- drafts: [],             // Cached IndexedDB drafts for Home preview grid
+ drafts: [],             // Cached active IndexedDB drafts
+ trashedDrafts: [],      // Soft-deleted recoverable drafts
+ showTrash: false,
  draftFilter: '',
 
  project: createBlankProject(),
  history: [],
  future: [],
  pendingEditSnapshot: null,
+ multiSelected: [],      // Array<{ track, id }>
 
- resTab: 'style',        // Active top resource bar tab (defaults to visual Style grid showcase or media)
- resSubCat: 'look',      // Sub-category inside left sidebar of resource dock
+ resTab: 'style',
+ resSubCat: 'look',
  resSearch: '',
- inspSubTab: 'content',  // 'content' | 'link' inside clip inspector
- menuOpen: false,
+ inspSubTab: 'content',  // 'content' | 'link'
+ trackMenuOpen: false,
 
  playing: false,
  rafId: 0,
  lastRafTs: 0,
- modal: null,            // null | { type: 'compile'|'import'|'char'|'scene', ... }
+ lastStageKey: '',
+ lastStageDrawTs: 0,
+ modal: null,            // null | { type: 'compile'|'import'|'char'|'scene'|'confirm'|'rename'|'help', ... }
  toastMsg: '',
  toastTimer: 0,
  dragState: null
@@ -129,19 +158,26 @@ function showToast(msg) {
  appState.toastTimer = setTimeout(() => {
   appState.toastMsg = '';
   document.getElementById('nleToast')?.remove();
- }, 2600);
+ }, 2800);
 }
 
 async function refreshDraftsCache() {
  try {
   appState.drafts = await listProjects();
+  appState.trashedDrafts = await listTrashedProjects();
  } catch {
   appState.drafts = [];
+  appState.trashedDrafts = [];
  }
 }
 
-function pushUndo(snapshot = null) {
- appState.history.push(snapshot || clone(appState.project));
+function pushUndo(snapshot = null, label = '编辑操作') {
+ const snapObj = snapshot?.project ? snapshot.project : (snapshot || clone(appState.project));
+ appState.history.push({
+  label: snapshot?.label || label,
+  ts: Date.now(),
+  project: snapObj
+ });
  if (appState.history.length > MAX_HISTORY) appState.history.shift();
  appState.future = [];
 }
@@ -168,28 +204,39 @@ function scheduleSave() {
 function undo() {
  if (!appState.history.length) return;
  stopPlayback();
- appState.future.push(clone(appState.project));
- appState.project = appState.history.pop();
+ const entry = appState.history.pop();
+ const prevProj = entry?.project || entry;
+ appState.future.push({ label: entry?.label || '重做步骤', ts: Date.now(), project: clone(appState.project) });
+ appState.project = prevProj;
+ appState.multiSelected = [];
  scheduleSave();
  render();
- showToast('已撤销');
+ showToast(`已撤销${entry?.label ? `：${entry.label}` : ''}`);
 }
 
 function redo() {
  if (!appState.future.length) return;
  stopPlayback();
- appState.history.push(clone(appState.project));
- appState.project = appState.future.pop();
+ const entry = appState.future.pop();
+ const nextProj = entry?.project || entry;
+ appState.history.push({ label: entry?.label || '历史操作', ts: Date.now(), project: clone(appState.project) });
+ appState.project = nextProj;
+ appState.multiSelected = [];
  scheduleSave();
  render();
- showToast('已重做');
+ showToast(`已重做${entry?.label ? `：${entry.label}` : ''}`);
 }
 
 function stopPlayback() {
+ const wasPlaying = appState.playing;
  appState.playing = false;
  if (appState.rafId) {
   cancelAnimationFrame(appState.rafId);
   appState.rafId = 0;
+ }
+ if (wasPlaying) {
+  appState.project.playhead = roundT(appState.project.playhead || 0);
+  updatePlayheadVisuals(true);
  }
  const btn = document.getElementById('playPauseBtn');
  if (btn) btn.innerHTML = `${uiIcon('play')}<span>播放</span>`;
@@ -210,23 +257,24 @@ function togglePlayback() {
  }
  appState.playing = true;
  appState.lastRafTs = performance.now();
+ appState.lastStageKey = '';
+ appState.lastStageDrawTs = 0;
  const btn = document.getElementById('playPauseBtn');
  if (btn) btn.innerHTML = `${uiIcon('pause')}<span>暂停</span>`;
 
  const tick = (now) => {
   if (!appState.playing) return;
-  const dt = Math.min(0.1, Math.max(0, (now - appState.lastRafTs) / 1000));
+  const dt = Math.min(0.1, Math.max(0.001, (now - appState.lastRafTs) / 1000));
   appState.lastRafTs = now;
   const dur = projectDuration(appState.project);
-  const next = appState.project.playhead + dt;
-  if (next >= dur) {
-   appState.project.playhead = roundT(dur);
-   updatePlayheadVisuals();
+  const step = advancePlayhead(appState.project.playhead, dt, dur);
+  appState.project.playhead = step.time;
+  if (step.ended) {
+   updatePlayheadVisuals(true);
    stopPlayback();
    return;
   }
-  appState.project.playhead = roundT(next);
-  updatePlayheadVisuals();
+  updatePlayheadVisuals(false, now);
   appState.rafId = requestAnimationFrame(tick);
  };
  appState.rafId = requestAnimationFrame(tick);
@@ -240,7 +288,7 @@ function selectedClipObj() {
 
 function ensureActiveVideoClip(defaultTitle = '新分镜') {
  let clip = selectedClipObj();
- if (clip && appState.project.selected?.track === 'video') return clip;
+ if (clip && trackKind(appState.project.selected?.track) === 'video') return clip;
  if (appState.project.tracks.video.length > 0) {
   const atPlay = stateAtTime(appState.project, appState.project.playhead).video || appState.project.tracks.video[0];
   appState.project.selected = { track: 'video', id: atPlay.id };
@@ -256,16 +304,18 @@ function renderSelectOptions(groupKey, selectedVal, emptyLabel = '— 默认 —
 }
 
 function clipTitleLabel(track, clip) {
- if (track === 'video') return clip.title || '新分镜';
- if (track === 'dialogue') return `${clip.speakerName || '角色'}: ${clip.text || '对白'}`;
- if (track === 'audio') return `${clip.kind === 'ambience' ? '环境' : '音效'}: ${clip.cue || '待填'}`;
- if (track === 'bgm') return `配乐: ${groupLabel('bgm', clip.style) || clip.mood || 'BGM'}`;
+ const kind = trackKind(track);
+ if (kind === 'video') return clip.title || '新分镜';
+ if (kind === 'dialogue') return `${clip.speakerName || '角色'}: ${clip.text || '对白'}`;
+ if (kind === 'audio') return `${clip.kind === 'ambience' ? '环境' : '音效'}: ${clip.cue || '待填'}`;
+ if (kind === 'bgm') return `配乐: ${groupLabel('bgm', clip.style) || clip.mood || 'BGM'}`;
  return clip.label || '调节层';
 }
 
 function clipSubLabel(track, clip) {
+ const kind = trackKind(track);
  const span = `${fmtTimecode(clip.start)} · ${clip.duration}s`;
- if (track === 'video') {
+ if (kind === 'video') {
   return [span, groupLabel('framing', clip.framing), groupLabel('move', clip.move)].filter(Boolean).join(' · ');
  }
  return span;
@@ -284,7 +334,7 @@ function renderDraftCard(item) {
  const dur = projectDuration(item);
  const vCount = item.tracks?.video?.length || 0;
  const firstShot = item.tracks?.video?.[0];
- const previewImg = firstShot?.refImage;
+ const previewImg = firstShot?.startRefImage || firstShot?.refImage;
  const previewText = firstShot?.prompt || firstShot?.title || '00:00 空白工程，等待开始剪辑';
 
  return `
@@ -292,7 +342,7 @@ function renderDraftCard(item) {
    <div class="draft-thumb" style="${previewImg ? '' : 'background:linear-gradient(155deg,#171a21,#0a0a0c);'}">
     ${previewImg ? `<img src="${esc(previewImg)}" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0.45;"/>` : ''}
     <div class="draft-thumb-top" style="position:relative;z-index:1;">
-     <span class="draft-aspect-pill">${esc(item.format || '16:9')}</span>
+     <span class="draft-aspect-pill">${esc(displayAspectLabel(item))}</span>
      <span style="color:var(--jy-teal);font-weight:700;">V1:${vCount}</span>
     </div>
     <div class="draft-thumb-mid" style="position:relative;z-index:1;">${esc(previewText)}</div>
@@ -302,16 +352,48 @@ function renderDraftCard(item) {
     </div>
    </div>
    <div class="draft-meta">
-    <div style="min-width:0;">
+    <div style="min-width:0;flex:1 1 auto;">
      <div class="draft-name" title="${esc(item.title)}">${esc(item.title || '未命名草稿')}</div>
      <div class="draft-sub">${esc(formatDateShort(item.updatedAt))} · ${dur}s</div>
     </div>
     <div class="draft-card-btns">
+     <button class="btn btn-sm" data-rename-draft="${esc(item.id)}" title="重命名草稿">${uiIcon('text')}</button>
+     <button class="btn btn-sm" data-clone-draft="${esc(item.id)}" title="复制草稿副本">${uiIcon('layers')}</button>
      <button class="btn btn-sm" data-export-draft="${esc(item.id)}" title="导出 JSON">${uiIcon('export')}</button>
-     <button class="btn btn-sm btn-danger" data-del-draft="${esc(item.id)}" title="删除草稿">${uiIcon('delete')}</button>
+     <button class="btn btn-sm btn-danger" data-del-draft="${esc(item.id)}" title="移入回收站">${uiIcon('delete')}</button>
     </div>
    </div>
   </div>`;
+}
+
+function renderTrashSection() {
+ const trashed = appState.trashedDrafts || [];
+ if (!trashed.length) return '';
+ return `
+  <section class="trash-section">
+   <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+    <button class="btn btn-sm" data-action="toggle-trash" style="gap:6px;">
+     ${uiIcon('delete')}
+     <span>回收站 (${trashed.length})</span>
+     ${uiIcon('chevron-down')}
+    </button>
+    ${appState.showTrash ? `<button class="btn btn-sm btn-danger" data-action="confirm-empty-trash">清空回收站</button>` : `<span style="font-size:11.5px;color:var(--text-dim);">误删的草稿可在此一键还原</span>`}
+   </div>
+   ${appState.showTrash ? `
+    <div class="history-list" style="margin-top:10px;max-height:260px;">
+     ${trashed.map((t) => `
+      <div class="history-item">
+       <div style="min-width:0;flex:1 1 auto;">
+        <div style="color:var(--text-main);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(t.title || '未命名草稿')}</div>
+        <div style="font-size:10.5px;color:var(--text-dim);">删除于 ${esc(formatDateShort(t.deletedAt))} · ${projectDuration(t)}s</div>
+       </div>
+       <div style="display:flex;gap:5px;flex:0 0 auto;">
+        <button class="btn btn-sm" data-restore-trash="${esc(t.id)}">${uiIcon('undo')}<span>还原</span></button>
+        <button class="btn btn-sm btn-danger" data-purge-trash="${esc(t.id)}">彻底删除</button>
+       </div>
+      </div>`).join('')}
+    </div>` : ''}
+  </section>`;
 }
 
 function renderHomeScreen() {
@@ -353,6 +435,7 @@ function renderHomeScreen() {
        <button class="btn" data-action="load-demo-enter">${uiIcon('sample-draft')}<span>加载 5 轨示例预览</span></button>
       </div>
      </div>`}
+    ${renderTrashSection()}
    </section>`;
  } else if (appState.homeTab === 'square') {
   mainHtml = `
@@ -389,7 +472,7 @@ function renderHomeScreen() {
     <div class="entity-item" style="padding:16px;">
      <div style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700;margin-bottom:6px;">${uiIcon('save', 'card-title-svg')}<span>本地持久化草稿 (${appState.drafts.length} 个)</span></div>
      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">每次添加镜头、调节滑块与编辑文字均会在 160ms 内自动保存，刷新浏览器不丢失。</div>
-     <button class="btn btn-sm btn-danger" data-action="clear-all-projects">${uiIcon('delete')}<span>清空本地历史草稿</span></button>
+     <button class="btn btn-sm btn-danger" data-action="confirm-clear-all">${uiIcon('delete')}<span>清空本地历史草稿</span></button>
     </div>
     <div class="entity-item" style="padding:16px;">
      <div style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700;margin-bottom:6px;">${uiIcon('import', 'card-title-svg')}<span>导入 1.0 / 2.0 工程档案</span></div>
@@ -399,7 +482,8 @@ function renderHomeScreen() {
    </div>
    ${appState.drafts.length ? `
     <div style="font-size:13.5px;font-weight:700;margin-top:4px;">所有已保存工程 (${appState.drafts.length})</div>
-    <div class="drafts-grid">${appState.drafts.map(renderDraftCard).join('')}</div>` : ''}`;
+    <div class="drafts-grid">${appState.drafts.map(renderDraftCard).join('')}</div>` : ''}
+   ${renderTrashSection()}`;
  }
 
  return `
@@ -657,25 +741,27 @@ function renderProgramMonitorInner() {
   ? 'radial-gradient(circle at 25% 25%, rgba(16,185,129,0.22), rgba(244,63,94,0.12) 60%, #090c14)'
   : 'radial-gradient(circle at 50% 35%, rgba(0,196,204,0.14), #090a0d)';
 
+ const heroRef = v.startRefImage || v.refImage;
  return `
   <div class="stage-visual" style="background:${bgStyle};">
-   ${v.refImage ? `<img class="stage-ref-img" src="${esc(v.refImage)}" alt="ref" />` : ''}
+   ${heroRef ? `<img class="stage-ref-img" src="${esc(heroRef)}" alt="ref" />` : ''}
    <div class="stage-scrim"></div>
    <div class="stage-top-row">
     <div class="stage-badges">
      <span class="stage-chip">V1 · ${esc(v.title || '分镜')}</span>
+     ${(st.pipVideos || []).map((pv) => `<span class="stage-chip">${esc(pv._trackCode || 'V2')} · ${esc(pv.title || '画中画')}</span>`).join('')}
      ${st.adjusts.map((a) => `<span class="stage-chip adj">${uiIcon('adjustment', 'chip-svg')}<span>${esc(a.label)}</span></span>`).join('')}
      ${st.transitionActive ? `<span class="stage-chip trans">${uiIcon('transition', 'chip-svg')}<span>${esc(groupLabel('transition', st.transitionActive.type))}</span></span>` : ''}
     </div>
     <div class="stage-badges">
-     ${st.audios.map((a) => `<span class="stage-chip sfx">${uiIcon('volume', 'chip-svg')}<span>${esc(a.cue.slice(0, 14))}</span></span>`).join('')}
+     ${st.audios.map((a) => `<span class="stage-chip sfx">${uiIcon('volume', 'chip-svg')}<span>${esc(a.cue)}</span></span>`).join('')}
      ${st.bgms.map((b) => `<span class="stage-chip bgm">${uiIcon('music-track', 'chip-svg')}<span>${esc(groupLabel('bgm', b.style) || 'BGM')}${b.isDucking ? ' [避让]' : ''}</span></span>`).join('')}
     </div>
    </div>
    <div class="stage-mid-vf">
     <div class="vf-framing-tag">${esc([groupLabel('framing', v.framing), groupLabel('move', v.move), groupLabel('look', v.style)].filter(Boolean).join(' · '))}</div>
-    <div class="vf-title">${esc(v.title || '未命名镜头')}</div>
-    <div class="vf-prompt">${esc(v.prompt || '在右侧「片段属性」填写动作画面描述，或在左侧点选风格方框')}</div>
+    <div class="vf-title" title="${esc(v.title)}">${esc(v.title || '未命名镜头')}</div>
+    <div class="vf-prompt" title="${esc(v.prompt || '')}">${esc(v.prompt || '在右侧「片段属性」填写动作画面描述，或在左侧点选风格方框')}</div>
    </div>
    <div class="stage-bottom-row">
     ${st.dialogues.map((d) => `<div class="subtitle-box"><span class="subtitle-speaker">${esc(d.speakerName || '角色')}:</span>${esc(d.text || '…')}</div>`).join('')}
@@ -683,7 +769,19 @@ function renderProgramMonitorInner() {
   </div>`;
 }
 
-function updatePlayheadVisuals() {
+function stageSignature(st) {
+ return [
+  st.video?.id || 'gap',
+  (st.pipVideos || []).map((x) => x.id).join(','),
+  (st.adjusts || []).map((x) => x.id).join(','),
+  (st.dialogues || []).map((x) => x.id).join(','),
+  (st.audios || []).map((x) => x.id).join(','),
+  (st.bgms || []).map((x) => `${x.id}:${x.isDucking}`).join(','),
+  st.transitionActive?.type || 'none'
+ ].join('|');
+}
+
+function updatePlayheadVisuals(forceStage = true, nowTs = 0) {
  const p = appState.project;
  const total = projectDuration(p);
  const needle = document.getElementById('playheadNeedle');
@@ -696,15 +794,53 @@ function updatePlayheadVisuals() {
   scrub.value = String(Math.min(Math.max(0, p.playhead), Math.max(1, total)));
  }
  const stage = document.getElementById('monitorStage');
- if (stage) stage.innerHTML = renderProgramMonitorInner();
+ if (stage) {
+  const sig = stageSignature(stateAtTime(p, p.playhead));
+  const shouldRefresh = forceStage || sig !== appState.lastStageKey || (nowTs - appState.lastStageDrawTs > 140);
+  if (shouldRefresh) {
+   appState.lastStageKey = sig;
+   appState.lastStageDrawTs = nowTs || performance.now();
+   stage.innerHTML = renderProgramMonitorInner();
+  }
+ }
+ if (appState.playing) {
+  const vp = document.getElementById('tlViewport');
+  if (vp) {
+   const needleX = Math.round(p.playhead * p.zoom);
+   if (needleX > vp.scrollLeft + vp.clientWidth - 48) {
+    vp.scrollLeft = Math.max(0, needleX - Math.round(vp.clientWidth * 0.25));
+   } else if (needleX < vp.scrollLeft) {
+    vp.scrollLeft = Math.max(0, needleX - 24);
+   }
+  }
+ }
+}
+
+function syncMonitorHeaderAndStageDims() {
+ const p = appState.project;
+ const ratio = aspectRatioParts(p.format, p.customAspect);
+ const hdrMeta = document.getElementById('monitorHeaderSpec');
+ if (hdrMeta) hdrMeta.textContent = `播放器 · ${displayAspectLabel(p)} · ${displayResolutionLabel(p)}`;
+ const stage = document.getElementById('monitorStage');
+ if (stage) {
+  stage.style.aspectRatio = `${ratio.w} / ${ratio.h}`;
+  stage.style.width = ratio.ratio >= 1 ? 'min(100%, 560px)' : 'auto';
+  stage.style.height = ratio.ratio < 1 ? 'min(100%, 260px)' : 'auto';
+ }
 }
 
 function updateCompiledAndLiveViews() {
+ const p = appState.project;
  const compileBox = document.getElementById('compileOutputBox');
- if (compileBox) compileBox.value = compileTimelinePrompt(appState.project);
+ if (compileBox) compileBox.value = compileTimelinePrompt(p);
+ const inspTitle = document.getElementById('inspProjTitleVal');
+ if (inspTitle) inspTitle.textContent = p.title || '未命名草稿';
+ const modalTitle = document.getElementById('compileModalProjTitle');
+ if (modalTitle) modalTitle.textContent = p.title || '未命名草稿';
+ syncMonitorHeaderAndStageDims();
  const stage = document.getElementById('monitorStage');
  if (stage) stage.innerHTML = renderProgramMonitorInner();
- const sel = appState.project.selected;
+ const sel = p.selected;
  if (sel?.id) {
   const clip = selectedClipObj();
   const titleNode = document.querySelector(`[data-clip-title="${sel.id}"]`);
@@ -722,46 +858,34 @@ function renderRightInspector() {
  const sel = p.selected;
  const clip = selectedClipObj();
 
- if (!sel || !clip) {
-  const negOpts = groupOptions('negative');
-  const issues = validateTimeline(p);
+ if (appState.multiSelected.length > 1) {
   return `
    <aside class="insp-pane">
     <div class="insp-head">
-     <span>${uiIcon('file-settings', 'hdr-svg')}<span>草稿参数</span></span>
-     <span style="font-size:11px;color:var(--text-dim);font-weight:500;">全局设置</span>
+     <span>${uiIcon('layers', 'hdr-svg')}<span>批量编辑 · 已选 ${appState.multiSelected.length} 段</span></span>
+     <button class="btn btn-sm" data-action="clear-multi-select">退出多选</button>
     </div>
     <div class="insp-scroll">
-     <div class="kv-row"><span class="kv-key">草稿名称</span><span class="kv-val">${esc(p.title)}</span></div>
-     <div class="kv-row"><span class="kv-key">存储模式</span><span class="kv-val" style="color:var(--jy-teal);">本地 IndexedDB (已开启)</span></div>
-     <div class="kv-row"><span class="kv-key">时间轴长度</span><span class="kv-val">${projectDuration(p)}s · ${p.tracks.video.length} 分镜</span></div>
-     <div class="kv-row">
-      <span class="kv-key">画幅比例</span>
-      <select class="select" style="width:130px;" data-proj-field="format">
-       ${NLE_FORMATS.map(([id, label]) => `<option value="${esc(id)}"${id === p.format ? ' selected' : ''}>${esc(label)}</option>`).join('')}
-      </select>
-     </div>
-     <div class="kv-row">
-      <span class="kv-key">分辨率</span>
-      <select class="select" style="width:130px;" data-proj-field="resolution">
-       ${NLE_RESOLUTIONS.map(([id, label]) => `<option value="${esc(id)}"${id === p.resolution ? ' selected' : ''}>${esc(label)}</option>`).join('')}
-      </select>
-     </div>
-     <div class="kv-row">
-      <span class="kv-key">帧率</span>
-      <select class="select" style="width:130px;" data-proj-num="fps">
-       ${NLE_FPS.map((f) => `<option value="${f}"${Number(p.fps) === f ? ' selected' : ''}>${f}.00 帧/秒</option>`).join('')}
-      </select>
-     </div>
-     <div class="field" style="margin-top:10px;">
-      <label>全局负向避坑词 (${p.negativePrompts.length})</label>
-      <div style="display:flex;flex-wrap:wrap;gap:4px;">
-       ${negOpts.slice(0, 12).map((n) => `<button class="pill-btn ${p.negativePrompts.includes(n.id) ? 'neg-on' : ''}" data-toggle-neg="${esc(n.id)}">${esc(n.label)}</button>`).join('')}
+     <div class="modal-alert warn">已按住 Ctrl / Shift 多选 <b>${appState.multiSelected.length}</b> 个时间轴片段。未锁定轨道将统一下发操作。</div>
+     <div class="field">
+      <label>批量设定统一时长 (s)</label>
+      <div class="neg-custom-row">
+       <input id="batchDurInput" class="input" type="number" step="0.5" min="0.5" value="4" />
+       <button class="btn btn-sm btn-jy" data-action="apply-batch-dur">应用时长</button>
       </div>
      </div>
-     <div class="field">
-      <label>镜头体检 (${issues.length})</label>
-      ${issues.slice(0, 3).map((it) => `<div class="issue-card ${esc(it.severity)}" data-jump-clip="${esc(it.clipId || '')}" data-jump-track="${esc(it.track || '')}">${esc(it.message)}</div>`).join('')}
+     <div class="field" style="margin-top:8px;">
+      <button class="btn btn-danger" style="width:100%;" data-action="apply-batch-delete">${uiIcon('delete')}<span>批量删除这 ${appState.multiSelected.length} 个片段</span></button>
+     </div>
+     <div class="field" style="margin-top:12px;">
+      <label>当前选中列表</label>
+      <div class="history-list">
+       ${appState.multiSelected.map((it) => {
+        const obj = (p.tracks?.[it.track] || []).find((c) => c.id === it.id);
+        if (!obj) return '';
+        return `<div class="history-item"><span>${esc(it.track.toUpperCase())} · ${esc(clipTitleLabel(it.track, obj))}</span><span>${obj.duration}s</span></div>`;
+       }).join('')}
+      </div>
      </div>
     </div>
     <div class="insp-foot">
@@ -770,12 +894,88 @@ function renderRightInspector() {
    </aside>`;
  }
 
+ if (!sel || !clip) {
+  const negOpts = groupOptions('negative');
+  const customNegList = parseCustomNegativeTags(p.customNegative);
+  const totalNegCount = (p.negativePrompts || []).length + customNegList.length;
+  const issues = validateTimeline(p);
+  const aspRaw = String(p.customAspect || '21:9').split(/[:xX/×]/);
+  const aspW = aspRaw[0] || '21';
+  const aspH = aspRaw[1] || '9';
+  const resParsed = parseCustomResolution(p.customResolution || '2560x1080');
+
+  return `
+   <aside class="insp-pane">
+    <div class="insp-head">
+     <span>${uiIcon('file-settings', 'hdr-svg')}<span>草稿参数</span></span>
+     <span style="font-size:11px;color:var(--text-dim);font-weight:500;">全局设置</span>
+    </div>
+    <div class="insp-scroll">
+     <div class="kv-row"><span class="kv-key">草稿名称</span><span id="inspProjTitleVal" class="kv-val" title="${esc(p.title)}">${esc(p.title)}</span></div>
+     <div class="kv-row"><span class="kv-key">存储模式</span><span class="kv-val" style="color:var(--jy-teal);">本地 IndexedDB (已开启)</span></div>
+     <div class="kv-row"><span class="kv-key">时间轴长度</span><span class="kv-val">${projectDuration(p)}s · ${countProjectClips(p)} 片段</span></div>
+     <div class="kv-row">
+      <span class="kv-key">画幅比例</span>
+      <select class="select" style="width:130px;" data-proj-field="format">
+       ${NLE_FORMATS.map(([id, label]) => `<option value="${esc(id)}"${id === p.format ? ' selected' : ''}>${esc(label)}</option>`).join('')}
+      </select>
+     </div>
+     ${p.format === 'custom' ? `
+      <div class="dim-pair">
+       <div class="dim-input-wrap"><span>自定义宽比</span><input class="input" type="number" step="0.01" min="0.1" max="99" data-custom-aspect="w" value="${esc(aspW)}" /></div>
+       <span class="dim-sep">:</span>
+       <div class="dim-input-wrap"><span>高比</span><input class="input" type="number" step="0.01" min="0.1" max="99" data-custom-aspect="h" value="${esc(aspH)}" /></div>
+      </div>` : ''}
+     <div class="kv-row">
+      <span class="kv-key">分辨率</span>
+      <select class="select" style="width:130px;" data-proj-field="resolution">
+       ${NLE_RESOLUTIONS.map(([id, label]) => `<option value="${esc(id)}"${id === p.resolution ? ' selected' : ''}>${esc(label)}</option>`).join('')}
+      </select>
+     </div>
+     ${p.resolution === 'custom' ? `
+      <div class="dim-pair">
+       <div class="dim-input-wrap"><span>宽度 (px)</span><input class="input" type="number" step="2" min="64" max="16384" data-custom-res="w" value="${esc(resParsed.w)}" /></div>
+       <span class="dim-sep">×</span>
+       <div class="dim-input-wrap"><span>高度 (px)</span><input class="input" type="number" step="2" min="64" max="16384" data-custom-res="h" value="${esc(resParsed.h)}" /></div>
+      </div>` : ''}
+     <div class="kv-row">
+      <span class="kv-key">帧率</span>
+      <select class="select" style="width:130px;" data-proj-num="fps">
+       ${NLE_FPS.map((f) => `<option value="${f}"${Number(p.fps) === f ? ' selected' : ''}>${f}.00 帧/秒</option>`).join('')}
+      </select>
+     </div>
+     <div class="field" style="margin-top:10px;">
+      <label>全局负向避坑词 (${totalNegCount})</label>
+      <div style="font-size:10.5px;color:var(--text-dim);margin:-2px 0 6px;">默认已勾选防漂移/防闪烁/去水印，可自由点击下方词条增减或自定义补充</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;">
+       ${negOpts.map((n) => `<button class="pill-btn ${p.negativePrompts.includes(n.id) ? 'neg-on' : ''}" data-toggle-neg="${esc(n.id)}" title="${esc(n.zh || n.label)}">${esc(n.label)}</button>`).join('')}
+       ${customNegList.map((tag) => `<button class="pill-btn neg-on" data-remove-custom-neg="${esc(tag)}" title="点击移除自定义避坑词">${esc(tag)} <span class="tag-remove">×</span></button>`).join('')}
+      </div>
+      <div class="neg-custom-row">
+       <input id="customNegInput" class="input" placeholder="输入自定义负向词（回车或点添加）" />
+       <button class="btn btn-sm" data-action="add-custom-neg">+ 添加</button>
+      </div>
+     </div>
+     <div class="field" style="margin-top:10px;">
+      <label>镜头体检 (${issues.length})</label>
+      ${issues.slice(0, 4).map((it) => `<div class="issue-card ${esc(it.severity)}" data-jump-clip="${esc(it.clipId || '')}" data-jump-track="${esc(it.track || '')}">${esc(it.message)}</div>`).join('')}
+     </div>
+    </div>
+    <div class="insp-foot">
+     <button class="btn btn-compile-hero" style="width:100%;" data-action="open-compile-modal">${uiIcon('compile-prompt')}<span>2.0 提示词编译导出</span></button>
+    </div>
+   </aside>`;
+ }
+
+ const selKind = trackKind(sel.track);
+ const sameTrackList = p.tracks?.[sel.track] || [];
+ const selIdx = sameTrackList.findIndex((c) => c.id === sel.id);
  let formHtml = '';
- if (sel.track === 'video') {
+ if (selKind === 'video') {
   formHtml = `
    <div class="sub-pill-tabs">
-    <button class="pill-btn ${appState.inspSubTab === 'content' ? 'active' : ''}" data-insp-sub="content">${uiIcon('script-text', 'pill-svg')}<span>画面与文案</span></button>
-    <button class="pill-btn ${appState.inspSubTab === 'link' ? 'active' : ''}" data-insp-sub="link">${uiIcon('character-ref', 'pill-svg')}<span>人物场景/参考</span></button>
+    <button class="pill-btn ${appState.inspSubTab === 'content' ? 'active' : ''}" data-insp-sub="content">${uiIcon('script-text', 'pill-svg')}<span>画面与运镜</span></button>
+    <button class="pill-btn ${appState.inspSubTab === 'link' ? 'active' : ''}" data-insp-sub="link">${uiIcon('character-ref', 'pill-svg')}<span>角色首尾帧/转场</span></button>
    </div>
    ${appState.inspSubTab === 'content' ? `
     <div class="field-grid">
@@ -783,13 +983,21 @@ function renderRightInspector() {
      <div class="field"><label>时长 (s)</label><input class="input" type="number" step="0.1" min="0.5" data-clip-num="duration" value="${esc(clip.duration)}" /></div>
     </div>
     <div class="field"><label>画面主体与动作 (Prompt)</label><textarea class="textarea" rows="3" data-clip-field="prompt" placeholder="描述画面核心动作，风格/运镜可在左侧方框一点直选…">${esc(clip.prompt)}</textarea></div>
+    <div class="field"><label>关键道具 / 手持物件</label><input class="input" data-clip-field="props" value="${esc(clip.props || '')}" placeholder="如：热豆浆纸杯、透明雨伞、旧信纸" /></div>
     <div class="field"><label>起幅状态</label><input class="input" data-clip-field="startState" value="${esc(clip.startState)}" placeholder="0% 首帧画面姿态" /></div>
     <div class="field"><label>落幅状态</label><input class="input" data-clip-field="endState" value="${esc(clip.endState)}" placeholder="100% 尾帧落点" /></div>
     <div class="field-grid">
-     <div class="field"><label>景别 (也可点左方框)</label><select class="select" data-clip-field="framing">${renderSelectOptions('framing', clip.framing)}</select></div>
-     <div class="field"><label>运镜 (也可点左方框)</label><select class="select" data-clip-field="move">${renderSelectOptions('move', clip.move)}</select></div>
+     <div class="field"><label>景别</label><select class="select" data-clip-field="framing">${renderSelectOptions('framing', clip.framing)}</select></div>
+     <div class="field"><label>运镜方式</label><select class="select" data-clip-field="move">${renderSelectOptions('move', clip.move)}</select></div>
+     <div class="field"><label>运镜速度</label><select class="select" data-clip-field="speed">${renderSelectOptions('speed', clip.speed)}</select></div>
+     <div class="field"><label>稳定方式</label><select class="select" data-clip-field="stability">${renderSelectOptions('stability', clip.stability)}</select></div>
+     <div class="field"><label>焦段镜头</label><select class="select" data-clip-field="lens">${renderSelectOptions('lens', clip.lens)}</select></div>
+     <div class="field"><label>运镜幅度描述</label><input class="input" data-clip-field="moveDistance" value="${esc(clip.moveDistance)}" placeholder="如：慢推半米 / 小幅" /></div>
      <div class="field"><label>美学风格</label><select class="select" data-clip-field="style">${renderSelectOptions('look', clip.style)}</select></div>
      <div class="field"><label>色彩影调</label><select class="select" data-clip-field="color">${renderSelectOptions('color', clip.color)}</select></div>
+     <div class="field"><label>主光源</label><select class="select" data-clip-field="lightSource">${renderSelectOptions('lightSource', clip.lightSource)}</select></div>
+     <div class="field"><label>时段 / 天光</label><select class="select" data-clip-field="time">${renderSelectOptions('time', clip.time)}</select></div>
+     <div class="field"><label>天气氛围</label><select class="select" data-clip-field="weather">${renderSelectOptions('weather', clip.weather)}</select></div>
     </div>
    ` : `
     <div class="field">
@@ -805,42 +1013,90 @@ function renderRightInspector() {
       ${p.characters.map((c) => `<button class="pill-btn ${(clip.characterIds || []).includes(c.id) ? 'active' : ''}" data-toggle-clip-char="${esc(c.id)}">${esc(c.name)}</button>`).join('') || '<span style="color:var(--text-dim);font-size:11px;">在左侧「角色场景」中添加角色</span>'}
      </div>
     </div>
-    <div class="field">
-     <label>入画转场 (${esc(groupLabel('transition', clip.transitionIn) || '硬切')})</label>
-     <input class="input" type="number" step="0.1" min="0" max="2" data-clip-num="transitionDur" value="${esc(clip.transitionDur)}" title="转场重叠时长(秒)" />
+    <div class="field-grid">
+     <div class="field">
+      <label>入画转场方式</label>
+      <select class="select" data-clip-field="transitionIn">${renderSelectOptions('transition', clip.transitionIn, '硬切（Cut）')}</select>
+     </div>
+     <div class="field">
+      <label>入画重叠时长 (s)</label>
+      <input class="input" type="number" step="0.1" min="0" max="2" data-clip-num="transitionDur" value="${esc(clip.transitionDur)}" title="硬切为 0s，叠化/淡入可设 0.2~2.0s" />
+     </div>
+     <div class="field">
+      <label>出画转场 / 结尾收束</label>
+      <select class="select" data-clip-field="transitionOut">${renderSelectOptions('transition', clip.transitionOut || '', '— 无 / 顺接下镜 —')}</select>
+     </div>
+     <div class="field">
+      <label>出画时长 (s)</label>
+      <input class="input" type="number" step="0.1" min="0" max="2" data-clip-num="transitionOutDur" value="${esc(clip.transitionOutDur || 0)}" title="片段结尾淡出或黑屏收缩时长(秒)" />
+     </div>
     </div>
     <div class="field">
-     <label>本地视觉参考图</label>
+     <label>首帧参考图 (0% Start Frame · 云端 URL 或本地上传)</label>
+     <input class="input" data-clip-field="startRefImage" value="${esc(clip.startRefImage || clip.refImage || '')}" placeholder="粘贴云端参考图 URL 或从下方上传本地首帧图" style="margin-bottom:4px;" />
      <input type="file" id="refImgInput" accept="image/*" style="font-size:11px;" />
-     ${clip.refImage ? `<button class="btn btn-sm btn-danger" style="margin-top:4px;" data-action="clear-ref-img">移除参考图</button>` : ''}
+     ${(clip.startRefImage || clip.refImage) ? `
+      <div class="ref-thumb-row">
+       <img class="ref-thumb-img" src="${esc(clip.startRefImage || clip.refImage)}" alt="首帧" />
+       <span style="font-size:11px;color:var(--text-muted);flex:1 1 auto;">首帧图已绑定</span>
+       <button class="btn btn-sm btn-danger" data-action="clear-ref-img">移除</button>
+      </div>` : ''}
+    </div>
+    <div class="field">
+     <label>尾帧参考图 (100% End Frame · 云端 URL 或本地上传)</label>
+     <input class="input" data-clip-field="endRefImage" value="${esc(clip.endRefImage || '')}" placeholder="粘贴云端参考图 URL 或从下方上传本地尾帧图" style="margin-bottom:4px;" />
+     <input type="file" id="endRefImgInput" accept="image/*" style="font-size:11px;" />
+     ${clip.endRefImage ? `
+      <div class="ref-thumb-row">
+       <img class="ref-thumb-img" src="${esc(clip.endRefImage)}" alt="尾帧" />
+       <span style="font-size:11px;color:var(--text-muted);flex:1 1 auto;">尾帧图已绑定</span>
+       <button class="btn btn-sm btn-danger" data-action="clear-end-ref-img">移除</button>
+      </div>` : ''}
     </div>
    `}`;
- } else if (sel.track === 'dialogue') {
+ } else if (selKind === 'dialogue') {
   formHtml = `
    <div class="field-grid">
     <div class="field"><label>说话人</label><input class="input" data-clip-field="speakerName" value="${esc(clip.speakerName)}" /></div>
     <div class="field"><label>语种</label><select class="select" data-clip-field="language">${LANGUAGE_OPTIONS.map((l) => `<option value="${esc(l)}"${l === clip.language ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></div>
     <div class="field"><label>入点 (s)</label><input class="input" type="number" step="0.1" min="0" data-clip-num="start" value="${esc(clip.start)}" /></div>
     <div class="field"><label>时长 (s)</label><input class="input" type="number" step="0.1" min="0.5" data-clip-num="duration" value="${esc(clip.duration)}" /></div>
+    <div class="field">
+     <label>字幕画面位置</label>
+     <select class="select" data-clip-field="subtitlePos">
+      <option value="bottom"${clip.subtitlePos === 'bottom' || !clip.subtitlePos ? ' selected' : ''}>底部居中</option>
+      <option value="top"${clip.subtitlePos === 'top' ? ' selected' : ''}>顶部悬浮</option>
+      <option value="center"${clip.subtitlePos === 'center' ? ' selected' : ''}>画面中央重点</option>
+      <option value="off"${clip.subtitlePos === 'off' ? ' selected' : ''}>仅配音（不渲染字幕）</option>
+     </select>
+    </div>
+    <div class="field"><label>字幕字体 / 样式</label><input class="input" data-clip-field="subtitleStyle" value="${esc(clip.subtitleStyle || '')}" placeholder="如：电影黑体白字 / 仿手写体" /></div>
    </div>
    <div class="field"><label>语气与停顿节奏</label><input class="input" data-clip-field="delivery" value="${esc(clip.delivery)}" /></div>
    <div class="field"><label>台词内容</label><textarea class="textarea" rows="3" data-clip-field="text">${esc(clip.text)}</textarea></div>`;
- } else if (sel.track === 'audio') {
+ } else if (selKind === 'audio') {
   formHtml = `
    <div class="field-grid">
     <div class="field"><label>分类</label><select class="select" data-clip-field="kind"><option value="sfx"${clip.kind === 'sfx' ? ' selected' : ''}>音效 SFX</option><option value="ambience"${clip.kind === 'ambience' ? ' selected' : ''}>环境声场</option></select></div>
+    <div class="field"><label>入点 (s)</label><input class="input" type="number" step="0.1" min="0" data-clip-num="start" value="${esc(clip.start)}" /></div>
     <div class="field"><label>时长 (s)</label><input class="input" type="number" step="0.1" min="0.5" data-clip-num="duration" value="${esc(clip.duration)}" /></div>
+    <div class="field"><label>淡入 (s)</label><input class="input" type="number" step="0.1" min="0" max="10" data-clip-num="fadeIn" value="${esc(clip.fadeIn || 0)}" /></div>
+    <div class="field"><label>淡出 (s)</label><input class="input" type="number" step="0.1" min="0" max="10" data-clip-num="fadeOut" value="${esc(clip.fadeOut || 0)}" /></div>
+    <div class="field"><label>空间与方位</label><input class="input" data-clip-field="spatial" value="${esc(clip.spatial || '')}" placeholder="如：画外由远及近 / 屋外窗边" /></div>
    </div>
-   <div class="field"><label>声音描述</label><textarea class="textarea" rows="3" data-clip-field="cue">${esc(clip.cue)}</textarea></div>
-   <div class="field"><label>空间与强弱</label><input class="input" data-clip-field="intensity" value="${esc(clip.intensity)}" /></div>`;
- } else if (sel.track === 'bgm') {
+   <div class="field"><label>声音描述</label><textarea class="textarea" rows="3" data-clip-field="cue" placeholder="如：细密雨点打在透明雨伞上 / 街头由远及近脚步声">${esc(clip.cue)}</textarea></div>
+   <div class="field"><label>音量与强弱</label><input class="input" data-clip-field="intensity" value="${esc(clip.intensity)}" placeholder="如：柔和铺底 / 清晰突出" /></div>`;
+ } else if (selKind === 'bgm') {
   formHtml = `
    <div class="field"><label>配乐流派</label><select class="select" data-clip-field="style">${renderSelectOptions('bgm', clip.style)}</select></div>
    <div class="field-grid">
     <div class="field"><label>入点 (s)</label><input class="input" type="number" step="0.1" min="0" data-clip-num="start" value="${esc(clip.start)}" /></div>
     <div class="field"><label>时长 (s)</label><input class="input" type="number" step="0.1" min="0.5" data-clip-num="duration" value="${esc(clip.duration)}" /></div>
+    <div class="field"><label>淡入 (s)</label><input class="input" type="number" step="0.1" min="0" max="10" data-clip-num="fadeIn" value="${esc(clip.fadeIn ?? 0.5)}" /></div>
+    <div class="field"><label>淡出 (s)</label><input class="input" type="number" step="0.1" min="0" max="10" data-clip-num="fadeOut" value="${esc(clip.fadeOut ?? 0.8)}" /></div>
    </div>
    <div class="field"><label>情绪走势</label><textarea class="textarea" rows="2" data-clip-field="mood">${esc(clip.mood)}</textarea></div>
+   <div class="field"><label>乐器 / 卡点补充备注</label><input class="input" data-clip-field="customNote" value="${esc(clip.customNote || '')}" placeholder="如：高潮处停止鼓点仅留单音钢琴" /></div>
    <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;cursor:pointer;"><input type="checkbox" data-clip-bool="duckUnderDialogue"${clip.duckUnderDialogue ? ' checked' : ''} /> 对白出现时自动避让压低</label>`;
  } else {
   formHtml = `
@@ -857,8 +1113,11 @@ function renderRightInspector() {
  return `
   <aside class="insp-pane">
    <div class="insp-head">
-    <span>${uiIcon('clip-settings', 'hdr-svg')}<span>片段参数 · ${esc(sel.track.toUpperCase())}</span></span>
-    <button class="btn btn-sm" data-action="deselect-clip" title="返回查看草稿全局参数">草稿参数</button>
+    <span>${uiIcon('clip-settings', 'hdr-svg')}<span>片段 · ${esc(sel.track.toUpperCase())}${sameTrackList.length ? ` (${selIdx + 1}/${sameTrackList.length})` : ''}</span></span>
+    <div style="display:flex;gap:4px;align-items:center;">
+     ${sameTrackList.length > 1 ? `<button class="btn btn-sm" data-action="prev-shot" title="切换到上一片段" style="padding:3px 6px;">&lt;</button><button class="btn btn-sm" data-action="next-shot" title="切换到下一片段" style="padding:3px 6px;">&gt;</button>` : ''}
+     <button class="btn btn-sm" data-action="deselect-clip" title="返回查看草稿全局参数">草稿参数</button>
+    </div>
    </div>
    <div class="insp-scroll">${formHtml}</div>
    <div class="insp-foot">
@@ -876,6 +1135,7 @@ function renderTimelineBody() {
  const viewSecs = Math.max(20, Math.ceil(total + 8));
  const widthPx = Math.max(960, Math.round(viewSecs * p.zoom));
  const majorStep = p.zoom >= 90 ? 1 : p.zoom >= 50 ? 2 : 5;
+ const allTracks = getAllTracks(p);
 
  let rulerHtml = '';
  for (let s = 0; s <= viewSecs; s += 0.5) {
@@ -885,8 +1145,13 @@ function renderTimelineBody() {
   if (isMajor) rulerHtml += `<div class="ruler-label" style="left:${x}px;">${esc(fmtTimecode(s))}</div>`;
  }
 
- const lanesHtml = TRACKS.map((tr) => {
-  const clips = p.tracks[tr.key] || [];
+ const lanesHtml = allTracks.map((tr) => {
+  const kind = tr.kind || trackKind(tr.key);
+  const clips = p.tracks?.[tr.key] || [];
+  const locked = isTrackLocked(p, tr.key);
+  const hidden = isTrackHidden(p, tr.key);
+  const muted = isTrackMuted(p, tr.key);
+
   let rowEnds = [0, 0];
   let hasOverlap = false;
   if (tr.key !== 'video') {
@@ -901,6 +1166,7 @@ function renderTimelineBody() {
    const left = Math.round(c.start * p.zoom);
    const width = Math.max(22, Math.round(c.duration * p.zoom));
    const isSel = p.selected?.track === tr.key && p.selected?.id === c.id;
+   const isMulti = appState.multiSelected.some((m) => m.track === tr.key && m.id === c.id);
    let subClass = '';
    if (hasOverlap) {
     const laneIdx = c.start >= rowEnds[0] - 0.01 ? 0 : 1;
@@ -908,7 +1174,7 @@ function renderTimelineBody() {
     subClass = ` subrow-${laneIdx}`;
    }
    return `
-    <div class="tl-clip ${esc(tr.key)}${subClass}${isSel ? ' selected' : ''}" data-clip-id="${esc(c.id)}" data-clip-track="${esc(tr.key)}" style="left:${left}px;width:${width}px;">
+    <div class="tl-clip ${esc(kind)}${subClass}${isSel ? ' selected' : ''}${isMulti && !isSel ? ' multi-selected' : ''}" data-clip-id="${esc(c.id)}" data-clip-track="${esc(tr.key)}" style="left:${left}px;width:${width}px;" title="${esc(clipTitleLabel(tr.key, c))} (${esc(clipSubLabel(tr.key, c))})">
      <div class="clip-handle-l"></div>
      <div class="clip-content">
       <div class="clip-title" data-clip-title="${esc(c.id)}">${esc(clipTitleLabel(tr.key, c))}</div>
@@ -930,24 +1196,39 @@ function renderTimelineBody() {
   }
 
   if (!clips.length && total === 0 && tr.key === 'video') {
-   clipsHtml += `<div class="tl-empty-drop">${uiIcon('storyboard-track', 'drop-svg')}<span>00:00 空白起剪：点击左上方「风格特效 / 运镜方框」或工具栏「+ 分镜 V1」，开始你的创作吧~</span></div>`;
+   clipsHtml += `<div class="tl-empty-drop">${uiIcon('storyboard-track', 'drop-svg')}<span>00:00 空白起剪：点击左上方「风格特效 / 运镜方框」或工具栏「+ 分镜」，开始你的创作吧~</span></div>`;
   }
 
-  return `<div class="tl-lane ${tr.key === 'video' ? 'video-row' : ''}" data-lane-track="${esc(tr.key)}">${clipsHtml}</div>`;
+  const laneStateCls = `${locked ? ' is-locked' : ''}${hidden ? ' is-hidden' : ''}${muted ? ' is-muted' : ''}`;
+  return `<div class="tl-lane ${tr.key === 'video' ? 'video-row' : ''}${laneStateCls}" data-lane-track="${esc(tr.key)}">${clipsHtml}</div>`;
  }).join('');
 
  return `
   <div class="tl-headers">
-   <div class="tl-corner"><span>轨道</span><span>${p.fps}fps</span></div>
-   ${TRACKS.map((tr) => `
-    <div class="tl-track-header ${tr.key === 'video' ? 'video-row' : ''}">
-     <div class="tl-th-info">
-      ${uiIcon(TRACK_ICON_MAP[tr.key] || 'layers', 'track-ico')}
-      <span class="track-badge ${esc(tr.key)}">${esc(tr.code)}</span>
-      <span class="tl-th-name">${esc(tr.label)}</span>
-     </div>
-     <button class="btn btn-sm" style="padding:2px 5px;" data-add-on-track="${esc(tr.key)}" title="添加${esc(tr.label)}">${uiIcon('plus')}</button>
-    </div>`).join('')}
+   <div class="tl-corner"><span>轨道 (${allTracks.length})</span><span>${p.fps}fps</span></div>
+   ${allTracks.map((tr) => {
+    const kind = tr.kind || trackKind(tr.key);
+    const locked = isTrackLocked(p, tr.key);
+    const hidden = isTrackHidden(p, tr.key);
+    const muted = isTrackMuted(p, tr.key);
+    const canHide = kind === 'video' || kind === 'adjust' || kind === 'dialogue';
+    const canMute = kind === 'dialogue' || kind === 'audio' || kind === 'bgm';
+    return `
+     <div class="tl-track-header ${tr.key === 'video' ? 'video-row' : ''}" title="${esc(tr.label)}">
+      <div class="tl-th-info">
+       ${uiIcon(TRACK_ICON_MAP[kind] || 'layers', 'track-ico')}
+       <span class="track-badge ${esc(kind)}">${esc(tr.code)}</span>
+       <span class="tl-th-name">${esc(tr.label)}</span>
+      </div>
+      <div class="th-actions">
+       ${canHide ? `<button class="th-btn ${hidden ? 'on' : ''}" data-track-toggle="hidden" data-track-key="${esc(tr.key)}" title="${hidden ? '显示该轨' : '隐藏该轨'}">${uiIcon(hidden ? 'eye-off' : 'eye')}</button>` : ''}
+       ${canMute ? `<button class="th-btn ${muted ? 'on' : ''}" data-track-toggle="muted" data-track-key="${esc(tr.key)}" title="${muted ? '取消静音' : '静音该轨'}">${uiIcon(muted ? 'volume-mute' : 'headphones')}</button>` : ''}
+       <button class="th-btn ${locked ? 'on' : ''}" data-track-toggle="locked" data-track-key="${esc(tr.key)}" title="${locked ? '解锁轨道' : '锁定轨道'}">${uiIcon(locked ? 'lock' : 'unlock')}</button>
+       <button class="th-btn add-mini" data-add-on-track="${esc(tr.key)}" title="在此轨插入片段">${uiIcon('plus')}</button>
+       ${tr.isCustom ? `<button class="th-btn" data-remove-track="${esc(tr.key)}" title="删除此新建轨道">${uiIcon('close')}</button>` : ''}
+      </div>
+     </div>`;
+   }).join('')}
   </div>
   <div id="tlViewport" class="tl-viewport">
    <div id="tlCanvas" class="tl-canvas" style="width:${widthPx}px;">
@@ -965,17 +1246,20 @@ function renderEditorScreen() {
  const total = projectDuration(p);
  const ratio = aspectRatioParts(p.format, p.customAspect);
  const clip = selectedClipObj();
+ const allTracks = getAllTracks(p);
+ const trackSummary = allTracks.map((tr) => `${tr.code}:${(p.tracks?.[tr.key] || []).length}`).join(' ');
 
  return `
   <header class="jy-topbar">
    <div class="topbar-left">
     <button class="btn btn-sm" data-action="go-home">${uiIcon('home')}<span>首页</span></button>
-    <button class="btn btn-sm" data-action="open-import">${uiIcon('import')}<span>导入 (1.0/2.0)</span></button>
+    <button class="btn btn-sm" data-action="open-import" data-import-tab="v2">${uiIcon('import')}<span>导入 (1.0/2.0)</span></button>
     <button class="btn btn-sm" data-action="load-demo">${uiIcon('sample-draft')}<span>示例草稿</span></button>
     <button class="btn btn-sm" data-action="new-blank-stay">${uiIcon('new-blank')}<span>新建空白</span></button>
+    <button class="btn btn-sm" data-action="clone-current-draft" title="将当前草稿复制为副本">${uiIcon('layers')}<span>复制草稿</span></button>
    </div>
    <div class="topbar-center">
-    <input class="title-input-center" data-proj-field="title" value="${esc(p.title)}" title="点击编辑草稿名称" />
+    <input class="title-input-center" data-proj-field="title" value="${esc(p.title)}" title="点击编辑草稿名称（实时同步）" />
    </div>
    <div class="topbar-right">
     <span class="no-ai-tag">${uiIcon('check', 'tag-svg')}<span>0 AI 依赖</span></span>
@@ -987,8 +1271,8 @@ function renderEditorScreen() {
    ${renderResourceDock()}
    <section class="monitor-pane">
     <div class="monitor-header">
-     <span>${uiIcon('aspect-ratio', 'hdr-svg')}<span>播放器 · ${esc(ratio.label)} · ${esc(p.resolution)}</span></span>
-     <span>V1:${p.tracks.video.length} T1:${p.tracks.dialogue.length} A1:${p.tracks.audio.length} A2:${p.tracks.bgm.length} E1:${p.tracks.adjust.length}</span>
+     <span style="display:inline-flex;align-items:center;gap:5px;">${uiIcon('aspect-ratio', 'hdr-svg')}<span id="monitorHeaderSpec">播放器 · ${esc(displayAspectLabel(p))} · ${esc(displayResolutionLabel(p))}</span></span>
+     <span>${esc(trackSummary)}</span>
     </div>
     <div class="monitor-bay">
      <div id="monitorStage" class="monitor-stage" style="aspect-ratio:${ratio.w} / ${ratio.h};width:${ratio.ratio >= 1 ? 'min(100%, 560px)' : 'auto'};height:${ratio.ratio < 1 ? 'min(100%, 260px)' : 'auto'};max-height:100%;">
@@ -1011,24 +1295,37 @@ function renderEditorScreen() {
   <section class="timeline-dock">
    <div class="tl-toolbar">
     <div class="tl-tool-group">
-     <button class="btn btn-sm" data-add-on-track="video">${uiIcon('plus')}<span>分镜 V1</span></button>
-     <button class="btn btn-sm" data-add-on-track="dialogue">${uiIcon('plus')}<span>对白 T1</span></button>
-     <button class="btn btn-sm" data-add-on-track="audio">${uiIcon('plus')}<span>音效 A1</span></button>
-     <button class="btn btn-sm" data-add-on-track="bgm">${uiIcon('plus')}<span>配乐 A2</span></button>
-     <button class="btn btn-sm" data-add-on-track="adjust">${uiIcon('plus')}<span>调节 E1</span></button>
+     <button class="btn btn-sm" data-add-on-track="adjust" title="在 E1 插入调节层片段">${uiIcon('plus')}<span>调节 E1</span></button>
+     <button class="btn btn-sm" data-add-on-track="video" title="在 V1 添加分镜片段">${uiIcon('plus')}<span>分镜 V1</span></button>
+     <button class="btn btn-sm" data-add-on-track="dialogue" title="在 T1 插入对白片段">${uiIcon('plus')}<span>对白 T1</span></button>
+     <button class="btn btn-sm" data-add-on-track="audio" title="在 A1 插入音效片段">${uiIcon('plus')}<span>音效 A1</span></button>
+     <button class="btn btn-sm" data-add-on-track="bgm" title="在 A2 插入配乐片段">${uiIcon('plus')}<span>配乐 A2</span></button>
+     <div class="tl-dropdown-wrap">
+      <button class="btn btn-sm" data-action="toggle-track-menu" title="在时间轴新增更多独立轨道">${uiIcon('layers')}<span>+ 新建轨道</span>${uiIcon('chevron-down')}</button>
+      ${appState.trackMenuOpen ? `
+       <div class="tl-popover">
+        <button class="tl-popover-item" data-new-track-kind="adjust"><span>新增调节层轨</span><span class="track-badge adjust">E+</span></button>
+        <button class="tl-popover-item" data-new-track-kind="video"><span>新增画中画 / 辅视频轨</span><span class="track-badge video">V+</span></button>
+        <button class="tl-popover-item" data-new-track-kind="dialogue"><span>新增对白 / 字幕轨</span><span class="track-badge dialogue">T+</span></button>
+        <button class="tl-popover-item" data-new-track-kind="audio"><span>新增音效 / 环境轨</span><span class="track-badge audio">A+</span></button>
+        <button class="tl-popover-item" data-new-track-kind="bgm"><span>新增配乐轨</span><span class="track-badge bgm">A+</span></button>
+       </div>` : ''}
+     </div>
      <div class="tl-sep"></div>
      <button class="btn btn-sm" data-action="undo"${appState.history.length ? '' : ' disabled'} title="撤销 (Ctrl+Z)">${uiIcon('undo')}</button>
-     <button class="btn btn-sm" data-action="redo"${appState.future.length ? '' : ' disabled'} title="重做 (Ctrl+Y)">${uiIcon('redo')}</button>
+     <button class="btn btn-sm" data-action="redo"${appState.future.length ? '' : ' disabled'} title="重做 (Ctrl+Y / Ctrl+Shift+Z)">${uiIcon('redo')}</button>
      <button class="btn btn-sm" data-action="split-playhead" title="在播放头红线分割片段 (B/S)">${uiIcon('split')}<span>分割</span></button>
      <button class="btn btn-sm" data-action="dup-selected"${clip ? '' : ' disabled'} title="复制选中">${uiIcon('layers')}</button>
-     <button class="btn btn-sm btn-danger" data-action="del-selected"${clip ? '' : ' disabled'} title="删除选中 (Del)">${uiIcon('delete')}</button>
+     <button class="btn btn-sm btn-danger" data-action="del-selected"${(clip || appState.multiSelected.length) ? '' : ' disabled'} title="删除选中 (Del)">${uiIcon('delete')}</button>
+     ${appState.multiSelected.length > 1 ? `<span class="batch-bar">多选 ${appState.multiSelected.length} 段</span>` : ''}
     </div>
     <div class="tl-tool-group">
+     <button class="btn btn-sm" data-action="open-help-modal" title="查看全部快捷键与撤销历史记录">${uiIcon('timer')}<span>历史 (${appState.history.length}) · 快捷键</span></button>
      <button class="btn btn-sm btn-jy" data-action="open-compile-modal">${uiIcon('compile-prompt')}<span>2.0 编译提示词</span></button>
      <div class="tl-sep"></div>
-     <button class="btn btn-sm ${p.snap ? 'btn-active' : ''}" data-action="toggle-snap">${uiIcon('magnet')}<span>磁吸</span></button>
-     <button class="btn btn-sm ${p.ripple ? 'btn-active' : ''}" data-action="toggle-ripple">${uiIcon('link')}<span>联动</span></button>
-     <input id="zoomSlider" type="range" min="36" max="150" step="4" value="${p.zoom}" style="width:80px;accent-color:var(--jy-teal);" title="缩放时间轴" />
+     <button class="btn btn-sm ${p.snap ? 'btn-active' : ''}" data-action="toggle-snap" aria-pressed="${p.snap ? 'true' : 'false'}" title="开关时间轴边缘自动磁吸对齐"><span class="toggle-dot"></span>${uiIcon('magnet')}<span>磁吸 ${p.snap ? '开' : '关'}</span></button>
+     <button class="btn btn-sm ${p.ripple ? 'btn-active' : ''}" data-action="toggle-ripple" aria-pressed="${p.ripple ? 'true' : 'false'}" title="开关 V1 主轨联动（紧贴无黑场 vs 自由保留空档）"><span class="toggle-dot"></span>${uiIcon('link')}<span>联动 ${p.ripple ? '开' : '关'}</span></button>
+     <input id="zoomSlider" type="range" min="36" max="150" step="4" value="${p.zoom}" style="width:76px;accent-color:var(--jy-teal);" title="缩放时间轴" />
     </div>
    </div>
    <div class="tl-body">${renderTimelineBody()}</div>
@@ -1045,14 +1342,17 @@ function renderModal() {
  if (m.type === 'compile') {
   const p = appState.project;
   const compiled = compileTimelinePrompt(p);
+  const canExport = hasExportableClips(p);
+  const trackCounts = getAllTracks(p).map((tr) => `${tr.code}:${(p.tracks?.[tr.key] || []).length}`).join(' / ');
   return `
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box wide">
      <div class="modal-head">
-      <span>${uiIcon('compile-prompt', 'modal-title-svg')}<span>镜序 2.0 多轨提示词编译导出 (${esc(p.title)})</span></span>
+      <span>${uiIcon('compile-prompt', 'modal-title-svg')}<span>镜序 2.0 多轨提示词编译导出 (<span id="compileModalProjTitle">${esc(p.title)}</span>)</span></span>
       <button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button>
      </div>
      <div class="modal-body">
+      ${!canExport ? `<div class="modal-alert warn">当前时间轴为空（0 个片段）：请至少在轨道中添加一个分镜、对白或音频片段，再进行提示词复制或导出。</div>` : ''}
       <div class="compile-modal-grid">
        <div style="display:flex;flex-direction:column;gap:10px;border-right:1px solid var(--border);padding-right:14px;">
         <div class="field">
@@ -1069,14 +1369,15 @@ function renderModal() {
          </select>
         </div>
         <div style="font-size:11.5px;color:var(--text-muted);line-height:1.6;padding:8px;background:#121215;border-radius:6px;border:1px solid var(--border);">
+         <div><b>规格：</b>${esc(displayAspectLabel(p))} · ${esc(displayResolutionLabel(p))} · ${p.fps}fps</div>
          <div><b>总时长：</b>${projectDuration(p)}s</div>
-         <div><b>轨道数量：</b>V1:${p.tracks.video.length} / T1:${p.tracks.dialogue.length} / A1:${p.tracks.audio.length} / A2:${p.tracks.bgm.length} / E1:${p.tracks.adjust.length}</div>
-         <div><b>说明：</b>已自动融合调节层覆写与跨镜 J-Cut / 人声避让标识。</div>
+         <div><b>轨道：</b>${esc(trackCounts)}</div>
+         <div><b>说明：</b>已自动融合调节层覆写、对白去重与人声避让标识。</div>
         </div>
-        <button class="btn btn-jy" style="padding:8px 12px;" data-action="copy-prompt">${uiIcon('layers')}<span>一键复制完整提示词</span></button>
+        <button class="btn btn-jy" style="padding:8px 12px;" data-action="copy-prompt"${canExport ? '' : ' disabled'}>${uiIcon('layers')}<span>一键复制完整提示词</span></button>
         <div style="display:flex;gap:6px;">
-         <button class="btn btn-sm" style="flex:1;" data-action="download-txt">${uiIcon('export')}<span>下载 .txt</span></button>
-         <button class="btn btn-sm" style="flex:1;" data-action="download-csv">${uiIcon('export')}<span>导出 .csv</span></button>
+         <button class="btn btn-sm" style="flex:1;" data-action="download-txt"${canExport ? '' : ' disabled'}>${uiIcon('export')}<span>下载 .txt</span></button>
+         <button class="btn btn-sm" style="flex:1;" data-action="download-csv"${canExport ? '' : ' disabled'}>${uiIcon('export')}<span>导出 .csv</span></button>
         </div>
         <button class="btn btn-sm" data-action="export-json">${uiIcon('save')}<span>导出工程备份 .jingxu2.json</span></button>
        </div>
@@ -1090,22 +1391,31 @@ function renderModal() {
  }
 
  if (m.type === 'import') {
+  const tab = m.tab === 'v1' ? 'v1' : 'v2';
   return `
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box">
      <div class="modal-head">
-      <span>${uiIcon('import', 'modal-title-svg')}<span>导入工程 (兼容 2.0 多轨 JSON & 1.0 .jingxu.json)</span></span>
+      <span>${uiIcon('import', 'modal-title-svg')}<span>导入工程 (${tab === 'v1' ? '镜序 1.0 .jingxu.json' : '镜序 2.0 .jingxu2.json'})</span></span>
       <button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button>
      </div>
      <div class="modal-body">
+      <div class="modal-tabs">
+       <button class="modal-tab-btn ${tab === 'v2' ? 'active' : ''}" data-import-tab-switch="v2">镜序 2.0 多轨 (.jingxu2.json)</button>
+       <button class="modal-tab-btn ${tab === 'v1' ? 'active' : ''}" data-import-tab-switch="v1">镜序 1.0 分镜迁移 (.jingxu.json)</button>
+      </div>
+      ${m.error ? `<div class="modal-alert error">${esc(m.error)}</div>` : ''}
       <label class="drop-zone" for="importFileInput">
-       <div>点击选择或将 <code>.json / .jingxu.json</code> 文件拖到这里</div>
-       <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">1.0 分镜会自动将口播台词、音效与配乐拆解进入 2.0 多轨时间轴</div>
-       <input id="importFileInput" type="file" accept=".json,.jingxu.json,application/json" style="display:none;" />
+       <div>点击选择或将 <code>${tab === 'v1' ? '.jingxu.json / .json' : '.jingxu2.json / .json'}</code> 文件拖到这里</div>
+       <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">${tab === 'v1' ? '1.0 分镜会自动将口播台词、音效与配乐拆解进入 2.0 多轨时间轴（支持自动兼容识别）' : '支持 2.0 完整多轨工程还原，并兼容直接导入 1.0 JSON 文件'}</div>
+       <input id="importFileInput" type="file" accept=".json,.jingxu.json,.jingxu2.json,application/json" style="display:none;" />
       </label>
       <div class="field">
-       <label>或直接粘贴 JSON 内容</label>
-       <textarea id="importPasteBox" class="textarea" rows="7" placeholder="粘贴 .jingxu2.json 或 .jingxu.json 全文…"></textarea>
+       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <label style="margin:0;">或直接粘贴 ${tab === 'v1' ? '1.0' : '2.0'} JSON 内容</label>
+        <button class="btn btn-sm" data-action="download-import-tpl">${uiIcon('export')}<span>下载空白 ${tab === 'v1' ? '1.0' : '2.0'} 模板</span></button>
+       </div>
+       <textarea id="importPasteBox" class="textarea" rows="7" placeholder="粘贴 ${tab === 'v1' ? '.jingxu.json' : '.jingxu2.json'} 全文…">${esc(m.text || '')}</textarea>
       </div>
       <div style="display:flex;justify-content:flex-end;gap:8px;">
        <button class="btn" data-close-modal="1">取消</button>
@@ -1118,23 +1428,139 @@ function renderModal() {
 
  if (m.type === 'char') {
   const c = m.draft;
+  const charPlaceholders = {
+   name: '如：林晚 / 陈默',
+   age: '如：24 岁',
+   gender: '如：女性 / 男性',
+   height: '如：165cm',
+   build: '如：偏瘦清秀 / 宽肩匀称',
+   occupation: '如：便利店夜班员工 / 外卖骑手',
+   appearance: '整体第一眼气质印象',
+   skin: '如：自然暖白肤色，眼下微青',
+   face: '如：柔和鹅蛋脸 / 清晰方脸下颌线',
+   eyes: '如：双眸温和 / 单眼皮深棕虹膜',
+   brows: '如：细长自然弯眉 / 平直浓眉',
+   nose: '如：小巧鼻梁 / 挺拔高鼻梁',
+   lips: '如：自然唇形 / 偏薄克制唇峰',
+   hair: '如：齐肩微湿短发 / 利落碎发',
+   hairColor: '如：深黑自然发色',
+   makeup: '如：素颜淡淡疲惫感',
+   outfit: '如：米白防雨风衣 / 深蓝旧冲锋衣',
+   accessories: '如：透明雨伞、旧帆布包',
+   habits: '如：微低头揉指节',
+   voice: '如：温柔略哑 / 沉稳低声',
+   language: '如：普通话 / 粤语',
+   variant: '如：雨夜湿发日常版'
+  };
   return `
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box">
-     <div class="modal-head"><span>${uiIcon('character-ref', 'modal-title-svg')}<span>编辑角色定妆卡</span></span><button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button></div>
+     <div class="modal-head"><span>${uiIcon('character-ref', 'modal-title-svg')}<span>${m.isNew ? '新增角色定妆卡' : '编辑角色定妆卡'}</span></span><button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button></div>
      <div class="modal-body">
-      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px;">
+      <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
        <span style="font-size:11px;color:var(--text-muted);">五官预设：</span>
        ${(FACE_PRESETS || []).map((fp, i) => `<button class="pill-btn" data-apply-face="${i}">${esc(fp.name)}</button>`).join('')}
       </div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:7px 10px;background:#121215;border:1px solid var(--border);border-radius:6px;margin-bottom:10px;">
+       <div style="display:flex;align-items:center;gap:6px;flex:1 1 180px;">
+        <label for="charField_role" style="font-size:11px;color:var(--text-muted);white-space:nowrap;">角色定位</label>
+        <input id="charField_role" class="input" data-char-draft="role" value="${esc(c.role || '')}" placeholder="如：女主 / 男主 / 配角" />
+       </div>
+       <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--jy-teal);font-weight:600;cursor:pointer;">
+        <input type="checkbox" data-char-lock="1"${c.lockIdentity ? ' checked' : ''} /> 锁定跨镜头外貌身份一致
+       </label>
+      </div>
+      <div class="field" style="margin-bottom:10px;">
+       <label for="charField_refImage">人物三视图 / 云端或本地参考图锁定</label>
+       <input id="charField_refImage" class="input" data-char-draft="refImage" value="${esc(c.refImage || '')}" placeholder="粘贴云端三视图 URL 或从下方上传本地定妆图…" style="margin-bottom:4px;" />
+       <input type="file" id="charRefImgInput" accept="image/*" style="font-size:11px;" />
+       ${c.refImage ? `
+        <div class="ref-thumb-row">
+         <img class="ref-thumb-img" src="${esc(c.refImage)}" alt="角色参考图" />
+         <span style="font-size:11px;color:var(--text-muted);flex:1 1 auto;">已绑定角色定妆参考图（导出提示词自动引用）</span>
+         <button class="btn btn-sm btn-danger" data-action="clear-char-ref-img">移除</button>
+        </div>` : ''}
+      </div>
       <div class="field-grid">
-       <div class="field"><label>定位</label><input class="input" data-char-draft="role" value="${esc(c.role || '')}" /></div>
-       <div class="field"><label style="display:flex;align-items:center;gap:6px;margin-top:16px;"><input type="checkbox" data-char-lock="1"${c.lockIdentity ? ' checked' : ''} /> 锁定跨镜头一致</label></div>
-       ${CHARACTER_FIELDS.map(([key, label]) => `<div class="field"><label>${esc(label)}</label><input class="input" data-char-draft="${esc(key)}" value="${esc(c[key] || '')}" /></div>`).join('')}
+       ${CHARACTER_FIELDS.map(([key, label]) => `<div class="field"><label for="charField_${esc(key)}">${esc(label)}</label><input id="charField_${esc(key)}" class="input" data-char-draft="${esc(key)}" value="${esc(c[key] || '')}" placeholder="${esc(charPlaceholders[key] || '')}" /></div>`).join('')}
       </div>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px;">
        <button class="btn" data-close-modal="1">取消</button>
        <button class="btn btn-jy" data-action="save-char-draft">保存角色</button>
+      </div>
+     </div>
+    </div>
+   </div>`;
+ }
+
+ if (m.type === 'confirm') {
+  return `
+   <div class="modal-backdrop" data-close-modal="1">
+    <div class="modal-box" style="width:min(440px,94vw);">
+     <div class="modal-head"><span>${esc(m.title || '确认操作')}</span><button class="btn btn-sm" data-close-modal="1">${uiIcon('close')}</button></div>
+     <div class="modal-body">
+      <div style="font-size:13px;line-height:1.6;color:var(--text-main);margin-bottom:16px;">${esc(m.message || '')}</div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;">
+       <button class="btn" data-close-modal="1">取消</button>
+       <button class="btn ${m.danger ? 'btn-danger' : 'btn-jy'}" data-action="confirm-modal-ok">${esc(m.confirmLabel || '确定')}</button>
+      </div>
+     </div>
+    </div>
+   </div>`;
+ }
+
+ if (m.type === 'rename') {
+  return `
+   <div class="modal-backdrop" data-close-modal="1">
+    <div class="modal-box" style="width:min(440px,94vw);">
+     <div class="modal-head"><span>${uiIcon('text', 'modal-title-svg')}<span>重命名草稿</span></span><button class="btn btn-sm" data-close-modal="1">${uiIcon('close')}</button></div>
+     <div class="modal-body">
+      <div class="field" style="margin-bottom:14px;">
+       <label>新草稿名称</label>
+       <input id="renameDraftInput" class="input" value="${esc(m.title || '')}" />
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;">
+       <button class="btn" data-close-modal="1">取消</button>
+       <button class="btn btn-jy" data-action="confirm-rename-draft">保存名称</button>
+      </div>
+     </div>
+    </div>
+   </div>`;
+ }
+
+ if (m.type === 'help') {
+  const rows = [...(appState.history || [])].reverse();
+  const shortcuts = [
+   ['撤销上一步', 'Ctrl + Z'],
+   ['重做下一步', 'Ctrl + Y / Ctrl+Shift+Z'],
+   ['播放 / 暂停预览', 'Space 空格'],
+   ['在播放头分割片段', 'B 或 S'],
+   ['删除当前选中片段', 'Delete / Backspace'],
+   ['微调 / 快进播放头', '← / →（+Shift 加速）'],
+   ['批量多选片段', 'Ctrl / Shift + 单击片段']
+  ];
+  return `
+   <div class="modal-backdrop" data-close-modal="1">
+    <div class="modal-box">
+     <div class="modal-head"><span>${uiIcon('timer', 'modal-title-svg')}<span>快捷键说明与操作撤销历史</span></span><button class="btn btn-sm" data-close-modal="1">${uiIcon('close')}</button></div>
+     <div class="modal-body">
+      <div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--jy-teal);">常用剪辑快捷键</div>
+      <div class="shortcut-grid">
+       ${shortcuts.map(([name, kbd]) => `<div class="shortcut-row"><span>${esc(name)}</span><span class="kbd-badge">${esc(kbd)}</span></div>`).join('')}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+       <span style="font-size:12px;font-weight:700;color:var(--jy-teal);">本次会话历史记录 (${rows.length} 条可撤销)</span>
+       <div style="display:flex;gap:6px;">
+        <button class="btn btn-sm" data-action="undo"${appState.history.length ? '' : ' disabled'}>${uiIcon('undo')}<span>撤销一步</span></button>
+        <button class="btn btn-sm" data-action="redo"${appState.future.length ? '' : ' disabled'}>${uiIcon('redo')}<span>重做</span></button>
+       </div>
+      </div>
+      <div class="history-list">
+       ${rows.length ? rows.map((h, i) => `
+        <div class="history-item">
+         <span>#${rows.length - i} · ${esc(h.label || '编辑操作')}</span>
+         <span>${esc(formatDateShort(h.ts))}</span>
+        </div>`).join('') : '<div style="font-size:12px;color:var(--text-dim);padding:10px;">当前会话暂无修改记录。</div>'}
       </div>
      </div>
     </div>
@@ -1167,15 +1593,33 @@ function renderModal() {
  return '';
 }
 
-function render() {
+function focusDescriptor(el) {
+ if (!el || el === document.body || !rootEl.contains(el)) return null;
+ if (el.id) return { sel: `#${el.id}` };
+ if (el.dataset?.clipNum) return { sel: `[data-clip-num="${el.dataset.clipNum}"]` };
+ if (el.dataset?.clipField) return { sel: `[data-clip-field="${el.dataset.clipField}"]` };
+ if (el.dataset?.projField) return { sel: `[data-proj-field="${el.dataset.projField}"]` };
+ if (el.dataset?.customAspect) return { sel: `[data-custom-aspect="${el.dataset.customAspect}"]` };
+ if (el.dataset?.customRes) return { sel: `[data-custom-res="${el.dataset.customRes}"]` };
+ return null;
+}
+
+function render(preserveOtherFocus = false) {
  const tlViewport = document.getElementById('tlViewport');
  const prevScrollLeft = tlViewport ? tlViewport.scrollLeft : 0;
+ const activeDesc = preserveOtherFocus ? focusDescriptor(document.activeElement) : null;
 
  rootEl.innerHTML = (appState.screen === 'home' ? renderHomeScreen() : renderEditorScreen()) + renderModal();
 
  const newVp = document.getElementById('tlViewport');
  if (newVp && prevScrollLeft > 0) newVp.scrollLeft = prevScrollLeft;
  bindTransientInputs();
+ if (activeDesc) {
+  const targetFocus = rootEl.querySelector(activeDesc.sel);
+  if (targetFocus && document.activeElement !== targetFocus) {
+   targetFocus.focus();
+  }
+ }
 }
 
 function bindTransientInputs() {
@@ -1230,13 +1674,61 @@ function bindTransientInputs() {
   refInput.addEventListener('change', async (e) => {
    const file = e.target.files?.[0];
    const clip = selectedClipObj();
-   if (!file || !clip || appState.project.selected?.track !== 'video') return;
+   if (!file || !clip || trackKind(appState.project.selected?.track) !== 'video') return;
    const dataUrl = await compressImageToDataUrl(file, 640);
-   pushUndo();
+   pushUndo(null, '设置首帧参考图');
+   clip.startRefImage = dataUrl;
    clip.refImage = dataUrl;
    scheduleSave();
    render();
-   showToast('已更新镜头参考图');
+   showToast('已更新分镜首帧参考图');
+  });
+ }
+
+ const endRefInput = document.getElementById('endRefImgInput');
+ if (endRefInput) {
+  endRefInput.addEventListener('change', async (e) => {
+   const file = e.target.files?.[0];
+   const clip = selectedClipObj();
+   if (!file || !clip || trackKind(appState.project.selected?.track) !== 'video') return;
+   const dataUrl = await compressImageToDataUrl(file, 640);
+   pushUndo(null, '设置尾帧参考图');
+   clip.endRefImage = dataUrl;
+   scheduleSave();
+   render();
+   showToast('已更新分镜尾帧参考图');
+  });
+ }
+
+ const charRefInput = document.getElementById('charRefImgInput');
+ if (charRefInput) {
+  charRefInput.addEventListener('change', async (e) => {
+   const file = e.target.files?.[0];
+   if (!file || appState.modal?.type !== 'char') return;
+   const dataUrl = await compressImageToDataUrl(file, 640);
+   appState.modal.draft.refImage = dataUrl;
+   render();
+   showToast('已载入角色定妆参考图');
+  });
+ }
+
+ const customNegInput = document.getElementById('customNegInput');
+ if (customNegInput) {
+  customNegInput.addEventListener('keydown', (e) => {
+   if (e.key === 'Enter') {
+    e.preventDefault();
+    commitCustomNegativeInput();
+   }
+  });
+ }
+
+ const renameInput = document.getElementById('renameDraftInput');
+ if (renameInput) {
+  renameInput.addEventListener('keydown', (e) => {
+   if (e.key === 'Enter') {
+    e.preventDefault();
+    rootEl.querySelector('[data-action="confirm-rename-draft"]')?.click();
+   }
   });
  }
 
@@ -1246,12 +1738,32 @@ function bindTransientInputs() {
    const file = e.target.files?.[0];
    if (!file) return;
    try {
-    loadImportedText(await file.text());
+    const raw = await file.text();
+    if (!raw.trim()) throw new Error(`所选文件「${file.name}」内容为空。`);
+    await loadImportedText(raw);
    } catch (err) {
+    if (appState.modal?.type === 'import') {
+     appState.modal.error = err.message;
+     render();
+    }
     showToast(`导入失败：${err.message}`);
    }
   });
  }
+}
+
+function commitCustomNegativeInput() {
+ const input = document.getElementById('customNegInput');
+ const raw = (input?.value || '').trim();
+ if (!raw) { showToast('请先输入自定义负向关键词'); return; }
+ const cur = parseCustomNegativeTags(appState.project.customNegative);
+ const added = parseCustomNegativeTags(raw).filter((t) => !cur.includes(t));
+ if (!added.length) { showToast('该负向关键词已存在'); if (input) input.value = ''; return; }
+ pushUndo(null, `添加负向词 ${added[0]}`);
+ appState.project.customNegative = [...cur, ...added].join(', ');
+ scheduleSave();
+ render();
+ showToast(`已添加自定义负向词：${added.join('、')}`);
 }
 
 function compressImageToDataUrl(file, maxW = 640) {
@@ -1277,15 +1789,19 @@ function compressImageToDataUrl(file, maxW = 640) {
 
 async function loadImportedText(rawText) {
  const nextProj = parseAnyProjectImport(rawText, { rekey: true });
- pushUndo();
+ if (appState.screen === 'editor' && hasProjectContent(appState.project)) {
+  try { await saveProject(appState.project); } catch {}
+ }
+ pushUndo(null, '导入工程');
  appState.project = nextProj;
+ appState.multiSelected = [];
  appState.modal = null;
  appState.screen = 'editor';
  await saveProject(nextProj);
  lastProject(nextProj.id);
  await refreshDraftsCache();
  render();
- showToast(`导入成功：${nextProj.tracks.video.length} 个分镜`);
+ showToast(`导入成功：已载入 ${nextProj.tracks.video.length} 个分镜`);
 }
 
 function downloadBlob(filename, content, mime = 'text/plain;charset=utf-8') {
@@ -1303,7 +1819,7 @@ function downloadBlob(filename, content, mime = 'text/plain;charset=utf-8') {
 ========================================================= */
 rootEl.addEventListener('focusin', (e) => {
  if (e.target.closest('input, textarea, select') && !appState.pendingEditSnapshot) {
-  appState.pendingEditSnapshot = clone(appState.project);
+  appState.pendingEditSnapshot = { label: '参数编辑', project: clone(appState.project) };
  }
 });
 
@@ -1317,9 +1833,32 @@ rootEl.addEventListener('input', (e) => {
  if (charDraft && appState.modal?.type === 'char') { appState.modal.draft[charDraft] = el.value; return; }
  if (sceneDraft && appState.modal?.type === 'scene') { appState.modal.draft[sceneDraft] = el.value; return; }
 
+ if (el.dataset.customAspect) {
+  const parts = String(appState.project.customAspect || '21:9').split(/[:xX/×]/);
+  let w = parts[0] || '21';
+  let h = parts[1] || '9';
+  if (el.dataset.customAspect === 'w') w = el.value || '16';
+  else h = el.value || '9';
+  appState.project.customAspect = `${w}:${h}`;
+  scheduleSave();
+  updateCompiledAndLiveViews();
+  return;
+ }
+
+ if (el.dataset.customRes) {
+  const cur = parseCustomResolution(appState.project.customResolution || '2560x1080');
+  const w = el.dataset.customRes === 'w' ? Math.max(64, Number(el.value) || cur.w) : cur.w;
+  const h = el.dataset.customRes === 'h' ? Math.max(64, Number(el.value) || cur.h) : cur.h;
+  appState.project.customResolution = `${w}x${h}`;
+  scheduleSave();
+  updateCompiledAndLiveViews();
+  return;
+ }
+
  const clip = selectedClipObj();
  if (clipField && clip && el.tagName !== 'SELECT') {
   clip[clipField] = el.value;
+  if (clipField === 'startRefImage') clip.refImage = el.value;
   scheduleSave();
   updateCompiledAndLiveViews();
   return;
@@ -1345,15 +1884,36 @@ rootEl.addEventListener('change', (e) => {
  if (charLock && appState.modal?.type === 'char') { appState.modal.draft.lockIdentity = Boolean(el.checked); return; }
  if (sceneDraft && appState.modal?.type === 'scene') { appState.modal.draft[sceneDraft] = el.value; return; }
 
+ if (el.dataset.customAspect || el.dataset.customRes) {
+  if (appState.pendingEditSnapshot) {
+   pushUndo(appState.pendingEditSnapshot, '修改自定义画幅参数');
+   appState.pendingEditSnapshot = null;
+  }
+  scheduleSave();
+  render();
+  return;
+ }
+
  if (appState.pendingEditSnapshot) {
-  pushUndo(appState.pendingEditSnapshot);
+  pushUndo(appState.pendingEditSnapshot, '调整参数');
   appState.pendingEditSnapshot = null;
  }
 
  if (clipField && clip) {
   clip[clipField] = el.value;
+  if (clipField === 'startRefImage') clip.refImage = el.value;
+  if (clipField === 'transitionIn') {
+   clip.transitionDur = Number(groupItem('transition', el.value)?.dur ?? 0);
+  }
+  if (clipField === 'transitionOut') {
+   clip.transitionOutDur = el.value ? Number(groupItem('transition', el.value)?.dur ?? 0.6) : 0;
+  }
   scheduleSave();
-  render();
+  if (el.tagName !== 'SELECT') {
+   updateCompiledAndLiveViews();
+  } else {
+   render(true);
+  }
   return;
  }
  if (clipNum && clip) {
@@ -1361,23 +1921,35 @@ rootEl.addEventListener('change', (e) => {
   const val = Number(el.value);
   if (Number.isFinite(val)) {
    if (clipNum === 'transitionDur') clip.transitionDur = roundT(Math.max(0, Math.min(2, val)));
+   else if (clipNum === 'transitionOutDur') clip.transitionOutDur = roundT(Math.max(0, Math.min(2, val)));
+   else if (clipNum === 'fadeIn' || clipNum === 'fadeOut') clip[clipNum] = roundT(Math.max(0, Math.min(10, val)));
    else if (clipNum === 'start') moveClip(appState.project, track, clip.id, Math.max(0, val));
    else if (clipNum === 'duration') trimClip(appState.project, track, clip.id, 'right', roundT(clip.start + Math.max(0.5, val)));
   }
   scheduleSave();
-  render();
+  render(true);
   return;
  }
  if (clipBool && clip) {
   clip[clipBool] = Boolean(el.checked);
   scheduleSave();
-  render();
+  render(true);
   return;
  }
  if (projField) {
   appState.project[projField] = el.value;
+  if (projField === 'format' && el.value === 'custom' && !appState.project.customAspect) {
+   appState.project.customAspect = '21:9';
+  }
+  if (projField === 'resolution' && el.value === 'custom' && !appState.project.customResolution) {
+   appState.project.customResolution = '2560x1080';
+  }
   scheduleSave();
-  render();
+  if (el.tagName !== 'SELECT') {
+   updateCompiledAndLiveViews();
+  } else {
+   render(true);
+  }
   return;
  }
  if (projNum) {
@@ -1390,29 +1962,100 @@ rootEl.addEventListener('change', (e) => {
 rootEl.addEventListener('click', async (e) => {
  const target = e.target;
 
- if (target.dataset.closeModal) {
-  appState.modal = null;
-  render();
-  return;
+ if (appState.trackMenuOpen && !target.closest('.tl-dropdown-wrap') && !target.closest('[data-action="toggle-track-menu"]')) {
+  appState.trackMenuOpen = false;
+  if (!target.closest('button, input, select, [data-open-draft], [data-preset-id], [data-apply-group]')) {
+   render();
+   return;
+  }
+ }
+
+ if (target.closest('[data-close-modal]')) {
+  if (target.dataset.closeModal || target.closest('button[data-close-modal]') || target.classList.contains('modal-backdrop')) {
+   appState.modal = null;
+   render();
+   return;
+  }
  }
 
  // Home Sidebar Tabs
  const homeTabBtn = target.closest('[data-home-tab]');
  if (homeTabBtn) {
   appState.homeTab = homeTabBtn.dataset.homeTab;
+  appState.showTrash = false;
   await refreshDraftsCache();
   render();
   return;
  }
 
- // Open/Delete/Export Draft Cards from Home
+ // Rename / Clone / Soft-Delete / Export Draft Cards from Home & Cloud
+ const renameDraftBtn = target.closest('[data-rename-draft]');
+ if (renameDraftBtn) {
+  e.stopPropagation();
+  const item = await loadProject(renameDraftBtn.dataset.renameDraft);
+  if (item) {
+   appState.modal = { type: 'rename', draftId: item.id, title: item.title || '' };
+   render();
+   requestAnimationFrame(() => document.getElementById('renameDraftInput')?.select());
+  }
+  return;
+ }
+
+ const cloneDraftBtn = target.closest('[data-clone-draft]');
+ if (cloneDraftBtn) {
+  e.stopPropagation();
+  const item = await loadProject(cloneDraftBtn.dataset.cloneDraft);
+  if (item) {
+   const cloned = cloneProject(item);
+   await saveProject(cloned);
+   await refreshDraftsCache();
+   render();
+   showToast(`已创建草稿副本「${cloned.title}」`);
+  }
+  return;
+ }
+
  const delDraftBtn = target.closest('[data-del-draft]');
  if (delDraftBtn) {
   e.stopPropagation();
-  await deleteProject(delDraftBtn.dataset.delDraft);
+  const item = await loadProject(delDraftBtn.dataset.delDraft);
+  const title = item?.title || '未命名草稿';
+  appState.modal = {
+   type: 'confirm',
+   title: '移入回收站确认',
+   message: `确定将草稿「${title}」移入本地回收站吗？（可在下方回收站中随时还原，不会立即永久丢失）`,
+   confirmLabel: '移入回收站',
+   danger: true,
+   confirmKind: 'soft-delete-draft',
+   draftId: delDraftBtn.dataset.delDraft
+  };
+  render();
+  return;
+ }
+
+ const restoreTrashBtn = target.closest('[data-restore-trash]');
+ if (restoreTrashBtn) {
+  e.stopPropagation();
+  await restoreProject(restoreTrashBtn.dataset.restoreTrash);
   await refreshDraftsCache();
   render();
-  showToast('已移除该草稿');
+  showToast('已从回收站还原草稿');
+  return;
+ }
+
+ const purgeTrashBtn = target.closest('[data-purge-trash]');
+ if (purgeTrashBtn) {
+  e.stopPropagation();
+  appState.modal = {
+   type: 'confirm',
+   title: '彻底删除草稿',
+   message: '彻底清除后该草稿将无法从 IndexedDB 恢复，确定永久删除吗？',
+   confirmLabel: '彻底删除',
+   danger: true,
+   confirmKind: 'purge-trash',
+   draftId: purgeTrashBtn.dataset.purgeTrash
+  };
+  render();
   return;
  }
 
@@ -1435,6 +2078,7 @@ rootEl.addEventListener('click', async (e) => {
    lastProject(appState.project.id);
    appState.history = [];
    appState.future = [];
+   appState.multiSelected = [];
    appState.screen = 'editor';
    render();
   }
@@ -1450,6 +2094,7 @@ rootEl.addEventListener('click', async (e) => {
    appState.project = next;
    appState.history = [];
    appState.future = [];
+   appState.multiSelected = [];
    appState.screen = 'editor';
    await saveProject(next);
    lastProject(next.id);
@@ -1457,6 +2102,16 @@ rootEl.addEventListener('click', async (e) => {
    render();
    showToast(`已套用模板「${tpl.title}」`);
   }
+  return;
+ }
+
+ // Import Modal Tabs
+ const importTabBtn = target.closest('[data-import-tab-switch]');
+ if (importTabBtn && appState.modal?.type === 'import') {
+  appState.modal.tab = importTabBtn.dataset.importTabSwitch === 'v1' ? 'v1' : 'v2';
+  appState.modal.error = '';
+  appState.modal.text = document.getElementById('importPasteBox')?.value || appState.modal.text || '';
+  render();
   return;
  }
 
@@ -1476,6 +2131,53 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
 
+ // Create / Remove / Toggle Tracks
+ const newTrackBtn = target.closest('[data-new-track-kind]');
+ if (newTrackBtn) {
+  const kind = newTrackBtn.dataset.newTrackKind;
+  stopPlayback();
+  pushUndo(null, '新建时间轴轨道');
+  const { track } = addExtraTrack(appState.project, kind);
+  appState.trackMenuOpen = false;
+  scheduleSave();
+  render();
+  showToast(`已新建独立轨道 ${track.code}（${track.label}）`);
+  return;
+ }
+
+ const removeTrackBtn = target.closest('[data-remove-track]');
+ if (removeTrackBtn) {
+  const key = removeTrackBtn.dataset.removeTrack;
+  stopPlayback();
+  pushUndo(null, '移除扩展轨道');
+  const { ok } = removeExtraTrack(appState.project, key);
+  if (ok) {
+   appState.multiSelected = appState.multiSelected.filter((m) => m.track !== key);
+   scheduleSave();
+   render();
+   showToast('已删除该扩展轨道');
+  } else {
+   appState.history.pop();
+  }
+  return;
+ }
+
+ const trackToggleBtn = target.closest('[data-track-toggle]');
+ if (trackToggleBtn) {
+  const field = trackToggleBtn.dataset.trackToggle;
+  const trKey = trackToggleBtn.dataset.trackKey;
+  pushUndo(null, '切换轨道状态');
+  if (!appState.project.trackMeta) appState.project.trackMeta = {};
+  if (!appState.project.trackMeta[trKey]) appState.project.trackMeta[trKey] = {};
+  const nextVal = !appState.project.trackMeta[trKey][field];
+  appState.project.trackMeta[trKey][field] = nextVal;
+  scheduleSave();
+  render();
+  const names = { locked: nextVal ? '轨道已锁定' : '轨道已解锁', hidden: nextVal ? '轨道已隐藏' : '轨道已恢复显示', muted: nextVal ? '轨道已静音' : '轨道已取消静音' };
+  showToast(names[field] || '已切换轨道状态');
+  return;
+ }
+
  // Click Square Swatch Box (方框选择!)
  const swatchBtn = target.closest('[data-apply-group]');
  if (swatchBtn) {
@@ -1483,26 +2185,39 @@ rootEl.addEventListener('click', async (e) => {
   const group = swatchBtn.dataset.applyGroup;
   const id = swatchBtn.dataset.applyId;
   const mode = swatchBtn.dataset.applyMode;
-  pushUndo();
 
   if (mode === 'add-bgm') {
-   addClip(appState.project, 'bgm', { style: id, mood: `搭配${groupLabel('bgm', id)}` });
-   showToast(`已添置 A2 配乐：${groupLabel('bgm', id)}`);
+   if (isTrackLocked(appState.project, 'bgm')) { showToast('A2 配乐轨已锁定，请先点击轨道头锁图标解锁'); return; }
+   pushUndo(null, `添置配乐：${groupLabel('bgm', id)}`);
+   const { clip, shifted } = addClip(appState.project, 'bgm', { style: id, mood: `搭配${groupLabel('bgm', id)}` });
+   appState.project.playhead = roundT(clip.start);
+   scheduleSave();
+   render();
+   showToast(shifted ? `当前位置已有配乐，已顺延至 ${fmtTimecode(clip.start)} 插入「${groupLabel('bgm', id)}」` : `已添置 A2 配乐：${groupLabel('bgm', id)}`);
+   return;
+  }
+
+  const targetVideoTrack = (appState.project.selected?.track && trackKind(appState.project.selected.track) === 'video')
+   ? appState.project.selected.track
+   : 'video';
+  if (isTrackLocked(appState.project, targetVideoTrack)) {
+   showToast('当前视频轨已锁定，请先解锁后再套用方框属性');
+   return;
+  }
+  pushUndo(null, `套用${groupLabel(group, id)}`);
+  const vClip = ensureActiveVideoClip(groupLabel(group, id) || '新分镜');
+  if (mode === 'set-trans') {
+   vClip.transitionIn = id;
+   vClip.transitionDur = Number(groupItem('transition', id)?.dur ?? 0);
+   showToast(`入画转场已设为：${groupLabel('transition', id)} (${vClip.transitionDur}s)`);
+  } else if (mode === 'toggle-tex') {
+   vClip.texture = vClip.texture || [];
+   vClip.texture = vClip.texture.includes(id) ? vClip.texture.filter((x) => x !== id) : [...vClip.texture, id];
+   showToast(`质感：${groupLabel('texture', id)}`);
   } else {
-   const vClip = ensureActiveVideoClip(groupLabel(group, id) || '新分镜');
-   if (mode === 'set-trans') {
-    vClip.transitionIn = id;
-    if (!vClip.transitionDur && id !== 'cut' && id !== 'direct_cut') vClip.transitionDur = 0.4;
-    showToast(`转场已应用：${groupLabel('transition', id)}`);
-   } else if (mode === 'toggle-tex') {
-    vClip.texture = vClip.texture || [];
-    vClip.texture = vClip.texture.includes(id) ? vClip.texture.filter((x) => x !== id) : [...vClip.texture, id];
-    showToast(`质感：${groupLabel('texture', id)}`);
-   } else {
-    const fieldMap = { look: 'style', color: 'color', medium: 'medium', framing: 'framing', move: 'move', angle: 'angle', lightSource: 'lightSource' };
-    vClip[fieldMap[group] || group] = id;
-    showToast(`已应用至「${vClip.title}」：${groupLabel(group, id)}`);
-   }
+   const fieldMap = { look: 'style', color: 'color', medium: 'medium', framing: 'framing', move: 'move', angle: 'angle', lightSource: 'lightSource' };
+   vClip[fieldMap[group] || group] = id;
+   showToast(`已应用至「${vClip.title}」：${groupLabel(group, id)}`);
   }
   scheduleSave();
   render();
@@ -1512,35 +2227,47 @@ rootEl.addEventListener('click', async (e) => {
  // Click Preset Card
  const presetCard = target.closest('[data-preset-id]');
  if (presetCard) {
+  const preset = CLIP_PRESETS.find((x) => x.id === presetCard.dataset.presetId);
+  if (preset && isTrackLocked(appState.project, preset.track)) {
+   showToast(`${preset.track.toUpperCase()} 轨道已锁定，请先解锁再插入`);
+   return;
+  }
   stopPlayback();
-  pushUndo();
-  const { clip } = addPresetClip(appState.project, presetCard.dataset.presetId);
+  pushUndo(null, `插入积木「${preset?.label || ''}」`);
+  const { clip, shifted } = addPresetClip(appState.project, presetCard.dataset.presetId);
   appState.project.playhead = roundT(clip.start);
   scheduleSave();
   render();
-  showToast(`已插入「${clipTitleLabel(appState.project.selected.track, clip)}」`);
+  const title = clipTitleLabel(appState.project.selected.track, clip);
+  showToast(shifted ? `当前播放头已有片段，已自动顺延至 ${fmtTimecode(clip.start)} 插入「${title}」` : `已插入「${title}」`);
   return;
  }
 
  const trackAddBtn = target.closest('[data-add-on-track]');
  if (trackAddBtn) {
-  stopPlayback();
   const track = trackAddBtn.dataset.addOnTrack;
-  pushUndo();
-  const spec = track === 'video' ? { title: `分镜 ${String(appState.project.tracks.video.length + 1).padStart(2, '0')}` } : {};
-  const { clip } = addClip(appState.project, track, spec);
+  if (isTrackLocked(appState.project, track)) { showToast('该轨道已锁定，请先点击轨道头锁图标解锁'); return; }
+  stopPlayback();
+  pushUndo(null, `添加 ${track.toUpperCase()} 片段`);
+  const kind = trackKind(track);
+  const spec = kind === 'video' ? { title: `分镜 ${String((appState.project.tracks[track]?.length || 0) + 1).padStart(2, '0')}` } : {};
+  const { clip, shifted } = addClip(appState.project, track, spec);
   appState.project.playhead = roundT(clip.start);
   scheduleSave();
   render();
+  if (shifted) showToast(`播放头位置已有片段，已自动顺延至 ${fmtTimecode(clip.start)} 排列`);
   return;
  }
 
  const jumpTransBtn = target.closest('[data-jump-trans]');
  if (jumpTransBtn) {
   appState.project.selected = { track: 'video', id: jumpTransBtn.dataset.jumpTrans };
+  appState.multiSelected = [];
   appState.resTab = 'transitions';
   appState.resSubCat = 'all';
+  const targetV = (appState.project.tracks.video || []).find((c) => c.id === jumpTransBtn.dataset.jumpTrans);
   render();
+  showToast(`已选中「${targetV?.title || '分镜'}」并打开转场面板，请在左侧方框选择入画转场`);
   return;
  }
 
@@ -1555,7 +2282,7 @@ rootEl.addEventListener('click', async (e) => {
  if (clipCharBtn) {
   const clip = selectedClipObj();
   if (clip && Array.isArray(clip.characterIds)) {
-   pushUndo();
+   pushUndo(null, '切换入镜角色');
    const cid = clipCharBtn.dataset.toggleClipChar;
    clip.characterIds = clip.characterIds.includes(cid) ? clip.characterIds.filter((x) => x !== cid) : [...clip.characterIds, cid];
    scheduleSave();
@@ -1566,12 +2293,24 @@ rootEl.addEventListener('click', async (e) => {
 
  const negBtn = target.closest('[data-toggle-neg]');
  if (negBtn) {
-  pushUndo();
+  pushUndo(null, '切换负向避坑词');
   const nid = negBtn.dataset.toggleNeg;
   const arr = appState.project.negativePrompts || [];
   appState.project.negativePrompts = arr.includes(nid) ? arr.filter((x) => x !== nid) : [...arr, nid];
   scheduleSave();
   render();
+  return;
+ }
+
+ const removeCustomNegBtn = target.closest('[data-remove-custom-neg]');
+ if (removeCustomNegBtn) {
+  const tag = removeCustomNegBtn.dataset.removeCustomNeg;
+  pushUndo(null, `移除负向词 ${tag}`);
+  const remain = parseCustomNegativeTags(appState.project.customNegative).filter((x) => x !== tag);
+  appState.project.customNegative = remain.join(', ');
+  scheduleSave();
+  render();
+  showToast(`已移除自定义负向词：${tag}`);
   return;
  }
 
@@ -1583,6 +2322,7 @@ rootEl.addEventListener('click', async (e) => {
    const targetClip = (appState.project.tracks[tr] || []).find((c) => c.id === cid);
    if (targetClip) {
     appState.project.selected = { track: tr, id: cid };
+    appState.multiSelected = [];
     appState.project.playhead = targetClip.start;
     render();
    }
@@ -1600,7 +2340,7 @@ rootEl.addEventListener('click', async (e) => {
  const bindCharBtn = target.closest('[data-bind-char]');
  if (bindCharBtn) {
   const v = ensureActiveVideoClip();
-  pushUndo();
+  pushUndo(null, '绑定入镜角色');
   if (!v.characterIds.includes(bindCharBtn.dataset.bindChar)) v.characterIds.push(bindCharBtn.dataset.bindChar);
   scheduleSave();
   render();
@@ -1609,7 +2349,7 @@ rootEl.addEventListener('click', async (e) => {
  }
  const delCharBtn = target.closest('[data-del-char]');
  if (delCharBtn) {
-  pushUndo();
+  pushUndo(null, '删除角色');
   appState.project.characters = appState.project.characters.filter((c) => c.id !== delCharBtn.dataset.delChar);
   scheduleSave();
   render();
@@ -1630,7 +2370,7 @@ rootEl.addEventListener('click', async (e) => {
  const bindSceneBtn = target.closest('[data-bind-scene]');
  if (bindSceneBtn) {
   const v = ensureActiveVideoClip();
-  pushUndo();
+  pushUndo(null, '绑定分镜场景');
   v.sceneId = bindSceneBtn.dataset.bindScene;
   scheduleSave();
   render();
@@ -1639,7 +2379,7 @@ rootEl.addEventListener('click', async (e) => {
  }
  const delSceneBtn = target.closest('[data-del-scene]');
  if (delSceneBtn) {
-  pushUndo();
+  pushUndo(null, '删除场景');
   appState.project.scenes = appState.project.scenes.filter((s) => s.id !== delSceneBtn.dataset.delScene);
   scheduleSave();
   render();
@@ -1650,11 +2390,145 @@ rootEl.addEventListener('click', async (e) => {
  if (!actBtn) return;
  const action = actBtn.dataset.action;
 
+ if (action === 'toggle-track-menu') {
+  appState.trackMenuOpen = !appState.trackMenuOpen;
+  render();
+  return;
+ }
+
+ if (action === 'toggle-trash') {
+  appState.showTrash = !appState.showTrash;
+  render();
+  return;
+ }
+
+ if (action === 'confirm-empty-trash') {
+  appState.modal = {
+   type: 'confirm',
+   title: '清空回收站确认',
+   message: `确定永久清空回收站中的全部 ${(appState.trashedDrafts || []).length} 份草稿吗？清除后无法找回。`,
+   confirmLabel: '确认清空回收站',
+   danger: true,
+   confirmKind: 'empty-trash'
+  };
+  render();
+  return;
+ }
+
+ if (action === 'confirm-clear-all') {
+  appState.modal = {
+   type: 'confirm',
+   title: '清空本地全部草稿确认',
+   message: '确定清空本地 IndexedDB 中储存的全部工程草稿（含回收站）吗？此操作无法撤销，建议先导出备份。',
+   confirmLabel: '确认清空全部',
+   danger: true,
+   confirmKind: 'clear-all-drafts'
+  };
+  render();
+  return;
+ }
+
+ if (action === 'confirm-rename-draft' && appState.modal?.type === 'rename') {
+  const newName = (document.getElementById('renameDraftInput')?.value || '').trim();
+  if (!newName) { showToast('草稿名称不能为空'); return; }
+  const item = await loadProject(appState.modal.draftId);
+  if (item) {
+   item.title = newName;
+   item.updatedAt = Date.now();
+   await saveProject(item);
+   if (appState.project?.id === item.id) appState.project.title = newName;
+  }
+  appState.modal = null;
+  await refreshDraftsCache();
+  render();
+  showToast(`已重命名为「${newName}」`);
+  return;
+ }
+
+ if (action === 'confirm-modal-ok' && appState.modal?.type === 'confirm') {
+  const m = appState.modal;
+  appState.modal = null;
+  if (m.confirmKind === 'soft-delete-draft' && m.draftId) {
+   await softDeleteProject(m.draftId);
+   await refreshDraftsCache();
+   appState.showTrash = true;
+   render();
+   showToast('已移入本地回收站，可随时还原');
+   return;
+  }
+  if (m.confirmKind === 'purge-trash' && m.draftId) {
+   await deleteProject(m.draftId);
+   await refreshDraftsCache();
+   render();
+   showToast('已彻底删除该草稿');
+   return;
+  }
+  if (m.confirmKind === 'empty-trash') {
+   await emptyTrash();
+   await refreshDraftsCache();
+   render();
+   showToast('回收站已清空');
+   return;
+  }
+  if (m.confirmKind === 'clear-all-drafts') {
+   await clearProjects();
+   clearLastProject();
+   await refreshDraftsCache();
+   render();
+   showToast('已清空全部本地草稿');
+   return;
+  }
+  if (m.confirmKind === 'new-blank') {
+   stopPlayback();
+   try { await saveProject(appState.project); } catch {}
+   appState.project = createBlankProject({ title: `${new Date().getMonth() + 1}月${new Date().getDate()}日 · 空白草稿` });
+   appState.history = [];
+   appState.future = [];
+   appState.multiSelected = [];
+   appState.screen = 'editor';
+   await saveProject(appState.project);
+   lastProject(appState.project.id);
+   await refreshDraftsCache();
+   render();
+   showToast('已自动保存原草稿，并打开新的空白工程');
+   return;
+  }
+  if (m.confirmKind === 'load-demo') {
+   stopPlayback();
+   try { await saveProject(appState.project); } catch {}
+   appState.project = createDemoProject();
+   appState.history = [];
+   appState.future = [];
+   appState.multiSelected = [];
+   appState.screen = 'editor';
+   await saveProject(appState.project);
+   lastProject(appState.project.id);
+   await refreshDraftsCache();
+   render();
+   showToast('已自动保存原草稿，并载入《雨夜巷口》5 轨示范草稿');
+   return;
+  }
+  render();
+  return;
+ }
+
  if (action === 'new-blank-enter' || action === 'new-blank-stay') {
+  if (action === 'new-blank-stay' && appState.screen === 'editor' && hasProjectContent(appState.project)) {
+   appState.modal = {
+    type: 'confirm',
+    title: '新建空白草稿确认',
+    message: '当前草稿已有编辑内容。切换前系统会先自动保存当前草稿到「本地草稿箱」（回首页即可重新打开），确定切换为空白工程吗？',
+    confirmLabel: '自动保存并新建空白',
+    confirmKind: 'new-blank'
+   };
+   render();
+   return;
+  }
   stopPlayback();
   appState.project = createBlankProject({ title: `${new Date().getMonth() + 1}月${new Date().getDate()}日 · 空白草稿` });
   appState.history = [];
   appState.future = [];
+  appState.multiSelected = [];
   appState.screen = 'editor';
   await saveProject(appState.project);
   lastProject(appState.project.id);
@@ -1664,16 +2538,44 @@ rootEl.addEventListener('click', async (e) => {
  }
 
  if (action === 'load-demo-enter' || action === 'load-demo') {
+  if (action === 'load-demo' && appState.screen === 'editor' && hasProjectContent(appState.project)) {
+   appState.modal = {
+    type: 'confirm',
+    title: '载入示例草稿确认',
+    message: '当前草稿已有编辑内容。载入示例前系统会先自动保存当前草稿到本地草稿箱（可从首页随时找回），确定切换到《雨夜巷口》示范工程吗？',
+    confirmLabel: '自动保存并载入示例',
+    confirmKind: 'load-demo'
+   };
+   render();
+   return;
+  }
   stopPlayback();
   appState.project = createDemoProject();
   appState.history = [];
   appState.future = [];
+  appState.multiSelected = [];
   appState.screen = 'editor';
   await saveProject(appState.project);
   lastProject(appState.project.id);
   await refreshDraftsCache();
   render();
   showToast('已载入《雨夜巷口》5 轨示范草稿');
+  return;
+ }
+
+ if (action === 'clone-current-draft') {
+  stopPlayback();
+  try { await saveProject(appState.project); } catch {}
+  const copy = cloneProject(appState.project);
+  appState.project = copy;
+  appState.history = [];
+  appState.future = [];
+  appState.multiSelected = [];
+  await saveProject(copy);
+  lastProject(copy.id);
+  await refreshDraftsCache();
+  render();
+  showToast(`已复制当前草稿为副本「${copy.title}」`);
   return;
  }
 
@@ -1692,9 +2594,47 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
 
+ if (action === 'open-help-modal') {
+  appState.modal = { type: 'help' };
+  render();
+  return;
+ }
+
  if (action === 'deselect-clip') {
   appState.project.selected = null;
+  appState.multiSelected = [];
   render();
+  return;
+ }
+
+ if (action === 'clear-multi-select') {
+  appState.multiSelected = [];
+  render();
+  return;
+ }
+
+ if (action === 'apply-batch-dur') {
+  if (!appState.multiSelected.length) return;
+  const val = Number(document.getElementById('batchDurInput')?.value);
+  if (!Number.isFinite(val) || val < 0.5) { showToast('请输入大于等于 0.5 的有效秒数'); return; }
+  stopPlayback();
+  pushUndo(null, '批量修改时长');
+  const res = batchUpdateClipDuration(appState.project, appState.multiSelected, val);
+  scheduleSave();
+  render();
+  showToast(`已将 ${res.updatedCount} 个未锁定片段统一设为 ${res.duration}s`);
+  return;
+ }
+
+ if (action === 'apply-batch-delete') {
+  if (!appState.multiSelected.length) return;
+  stopPlayback();
+  pushUndo(null, '批量删除片段');
+  const res = deleteClips(appState.project, appState.multiSelected);
+  appState.multiSelected = [];
+  scheduleSave();
+  render();
+  showToast(`已批量删除 ${res.deletedCount} 个片段`);
   return;
  }
 
@@ -1703,11 +2643,34 @@ rootEl.addEventListener('click', async (e) => {
  if (action === 'seek-end') { stopPlayback(); appState.project.playhead = projectDuration(appState.project); updatePlayheadVisuals(); return; }
  if (action === 'undo') { undo(); return; }
  if (action === 'redo') { redo(); return; }
- if (action === 'open-import') { appState.modal = { type: 'import' }; render(); return; }
+ if (action === 'open-import') {
+  const reqTab = actBtn.dataset.importTab === 'v1' ? 'v1' : 'v2';
+  appState.modal = { type: 'import', tab: reqTab, error: '', text: '' };
+  render();
+  return;
+ }
+
+ if (action === 'download-import-tpl' && appState.modal?.type === 'import') {
+  const tab = appState.modal.tab === 'v1' ? 'v1' : 'v2';
+  const ext = tab === 'v1' ? 'blank_v1_template.jingxu.json' : 'blank_v2_template.jingxu2.json';
+  downloadBlob(ext, createBlankTemplateJson(tab), 'application/json;charset=utf-8');
+  showToast(`已下载 ${tab === 'v1' ? '1.0' : '2.0'} 标准空白模板`);
+  return;
+ }
 
  if (action === 'confirm-import-paste') {
   const box = document.getElementById('importPasteBox');
-  try { await loadImportedText(box?.value || ''); } catch (err) { showToast(`导入失败：${err.message}`); }
+  const raw = box?.value || '';
+  try {
+   await loadImportedText(raw);
+  } catch (err) {
+   if (appState.modal?.type === 'import') {
+    appState.modal.text = raw;
+    appState.modal.error = err.message;
+    render();
+   }
+   showToast(`导入失败：${err.message}`);
+  }
   return;
  }
 
@@ -1718,30 +2681,30 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
 
- if (action === 'clear-all-projects') {
-  await clearProjects();
-  clearLastProject();
-  await refreshDraftsCache();
-  render();
-  showToast('已清空全部本地草稿');
+ if (action === 'add-custom-neg') {
+  commitCustomNegativeInput();
   return;
  }
 
  if (action === 'quick-add-video' || action === 'quick-add-dialogue' || action === 'quick-add-audio' || action === 'quick-add-bgm' || action === 'quick-add-adjust') {
   const tr = { 'quick-add-video': 'video', 'quick-add-dialogue': 'dialogue', 'quick-add-audio': 'audio', 'quick-add-bgm': 'bgm', 'quick-add-adjust': 'adjust' }[action];
+  if (isTrackLocked(appState.project, tr)) { showToast('该轨道已锁定，请先点击轨道头锁图标解锁'); return; }
   stopPlayback();
-  pushUndo();
+  pushUndo(null, `新建 ${tr.toUpperCase()} 片段`);
   const spec = tr === 'video' ? { title: `分镜 ${String(appState.project.tracks.video.length + 1).padStart(2, '0')}` } : {};
-  const { clip } = addClip(appState.project, tr, spec);
+  const { clip, shifted } = addClip(appState.project, tr, spec);
   appState.project.playhead = roundT(clip.start);
   scheduleSave();
   render();
+  if (shifted) showToast(`当前播放头已有片段，已自动顺延至 ${fmtTimecode(clip.start)} 插入`);
   return;
  }
 
  if (action === 'split-playhead') {
+  const selTrack = appState.project.selected?.track;
+  if (selTrack && isTrackLocked(appState.project, selTrack)) { showToast('当前轨道已锁定，无法分割'); return; }
   stopPlayback();
-  pushUndo();
+  pushUndo(null, '分割片段');
   const res = splitAtPlayhead(appState.project);
   if (!res.ok) { appState.history.pop(); showToast(res.reason || '当前无法分割'); return; }
   scheduleSave();
@@ -1753,8 +2716,9 @@ rootEl.addEventListener('click', async (e) => {
  if (action === 'dup-selected') {
   const sel = appState.project.selected;
   if (!sel) return;
+  if (isTrackLocked(appState.project, sel.track)) { showToast('当前轨道已锁定，请先解锁再复制'); return; }
   stopPlayback();
-  pushUndo();
+  pushUndo(null, '复制片段');
   duplicateClip(appState.project, sel.track, sel.id);
   scheduleSave();
   render();
@@ -1762,28 +2726,74 @@ rootEl.addEventListener('click', async (e) => {
  }
 
  if (action === 'del-selected') {
+  if (appState.multiSelected.length > 1) {
+   stopPlayback();
+   pushUndo(null, '批量删除片段');
+   const res = deleteClips(appState.project, appState.multiSelected);
+   appState.multiSelected = [];
+   scheduleSave();
+   render();
+   showToast(`已删除 ${res.deletedCount} 个片段`);
+   return;
+  }
   const sel = appState.project.selected;
   if (!sel) return;
+  if (isTrackLocked(appState.project, sel.track)) { showToast('当前轨道已锁定，请先解锁后再删除'); return; }
   stopPlayback();
-  pushUndo();
+  pushUndo(null, '删除片段');
   deleteClip(appState.project, sel.track, sel.id);
+  appState.multiSelected = [];
   scheduleSave();
   render();
   return;
  }
 
- if (action === 'toggle-snap') { appState.project.snap = !appState.project.snap; scheduleSave(); render(); return; }
- if (action === 'toggle-ripple') {
-  appState.project.ripple = !appState.project.ripple;
-  if (appState.project.ripple) { pushUndo(); normalizeAllTracks(appState.project); }
+ if (action === 'toggle-snap') {
+  appState.project.snap = !appState.project.snap;
   scheduleSave();
   render();
+  showToast(appState.project.snap ? '磁吸对齐已开启：拖动片段自动吸附到红线与相邻边界' : '磁吸对齐已关闭：可自由精调至 0.1 秒');
+  return;
+ }
+
+ if (action === 'toggle-ripple') {
+  appState.project.ripple = !appState.project.ripple;
+  if (appState.project.ripple) {
+   pushUndo(null, '开启 V1 主轨联动');
+   normalizeAllTracks(appState.project);
+  }
+  scheduleSave();
+  render();
+  showToast(appState.project.ripple ? 'V1 主轨联动已开启：删除或移动自动紧贴无黑场' : 'V1 主轨联动已关闭：允许拖开间隙与黑场留白');
   return;
  }
 
  if (action === 'clear-ref-img') {
   const clip = selectedClipObj();
-  if (clip) { pushUndo(); clip.refImage = ''; scheduleSave(); render(); }
+  if (clip) {
+   pushUndo(null, '移除首帧参考图');
+   clip.startRefImage = '';
+   clip.refImage = '';
+   scheduleSave();
+   render();
+  }
+  return;
+ }
+
+ if (action === 'clear-end-ref-img') {
+  const clip = selectedClipObj();
+  if (clip) {
+   pushUndo(null, '移除尾帧参考图');
+   clip.endRefImage = '';
+   scheduleSave();
+   render();
+  }
+  return;
+ }
+
+ if (action === 'clear-char-ref-img' && appState.modal?.type === 'char') {
+  appState.modal.draft.refImage = '';
+  render();
   return;
  }
 
@@ -1793,7 +2803,7 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
  if (action === 'save-char-draft' && appState.modal?.type === 'char') {
-  pushUndo();
+  pushUndo(null, '保存角色定妆卡');
   const d = appState.modal.draft;
   if (appState.modal.isNew) appState.project.characters.push(d);
   else { const idx = appState.project.characters.findIndex((x) => x.id === d.id); if (idx >= 0) appState.project.characters[idx] = d; }
@@ -1808,7 +2818,7 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
  if (action === 'save-scene-draft' && appState.modal?.type === 'scene') {
-  pushUndo();
+  pushUndo(null, '保存场景空间锚点');
   const d = appState.modal.draft;
   if (appState.modal.isNew) appState.project.scenes.push(d);
   else { const idx = appState.project.scenes.findIndex((x) => x.id === d.id); if (idx >= 0) appState.project.scenes[idx] = d; }
@@ -1819,6 +2829,7 @@ rootEl.addEventListener('click', async (e) => {
  }
 
  if (action === 'copy-prompt') {
+  if (!hasExportableClips(appState.project)) { showToast('当前时间轴为空，请先添置至少一个片段后再复制导出'); return; }
   const txt = compileTimelinePrompt(appState.project);
   try {
    await navigator.clipboard.writeText(txt);
@@ -1829,36 +2840,71 @@ rootEl.addEventListener('click', async (e) => {
   }
   return;
  }
- if (action === 'download-txt') { downloadBlob(`${appState.project.title || 'prompt'}.txt`, compileTimelinePrompt(appState.project)); return; }
- if (action === 'download-csv') { downloadBlob(`${appState.project.title || 'storyboard'}.csv`, '\uFEFF' + compileTimelinePrompt(appState.project, 'table'), 'text/csv;charset=utf-8'); }
+ if (action === 'prev-shot' || action === 'next-shot') {
+  const sel = appState.project.selected;
+  if (!sel?.track) return;
+  const list = appState.project.tracks?.[sel.track] || [];
+  if (list.length < 2) return;
+  const idx = list.findIndex((c) => c.id === sel.id);
+  const delta = action === 'prev-shot' ? -1 : 1;
+  const nextIdx = (idx + delta + list.length) % list.length;
+  const nextClip = list[nextIdx];
+  appState.project.selected = { track: sel.track, id: nextClip.id };
+  appState.project.playhead = roundT(nextClip.start);
+  appState.multiSelected = [];
+  render();
+  const vp = document.getElementById('tlViewport');
+  if (vp) {
+   const leftX = Math.round(nextClip.start * appState.project.zoom);
+   const rightX = Math.round((nextClip.start + nextClip.duration) * appState.project.zoom);
+   if (leftX < vp.scrollLeft + 24 || rightX > vp.scrollLeft + vp.clientWidth - 24) {
+    vp.scrollLeft = Math.max(0, leftX - 48);
+   }
+  }
+  return;
+ }
+
+ if (action === 'download-txt') {
+  if (!hasExportableClips(appState.project)) { showToast('当前时间轴为空，无法导出空提示词文本'); return; }
+  downloadBlob(`${appState.project.title || 'prompt'}.txt`, compileTimelinePrompt(appState.project));
+  showToast('已下载提示词 .txt 文件');
+  return;
+ }
+ if (action === 'download-csv') {
+  if (!hasExportableClips(appState.project)) { showToast('当前时间轴为空，无法导出空分镜表'); return; }
+  downloadBlob(`${appState.project.title || 'storyboard'}.csv`, '\uFEFF' + compileTimelinePrompt(appState.project, 'table'), 'text/csv;charset=utf-8');
+  showToast('已下载分镜表 .csv 文件');
+ }
 });
 
 /* =========================================================
    POINTER DRAG (PLAYHEAD + CLIP MOVE + EDGE TRIM)
 ========================================================= */
-function snapTimeCandidate(rawTime, excludeId) {
+function findSnapMatch(rawTime, excludeId) {
  const p = appState.project;
- if (!p.snap) return roundT(rawTime);
- const threshold = Math.max(0.15, 10 / p.zoom);
+ if (!p.snap) return { time: roundT(rawTime), snapped: false };
+ const threshold = Math.max(0.18, 12 / p.zoom);
  const targets = [0, p.playhead];
- for (const k of ['adjust', 'video', 'dialogue', 'audio', 'bgm']) {
-  for (const c of p.tracks[k] || []) {
+ for (const tr of getAllTracks(p)) {
+  for (const c of p.tracks?.[tr.key] || []) {
    if (c.id === excludeId) continue;
    targets.push(c.start, roundT(c.start + c.duration));
   }
  }
  let best = roundT(rawTime);
  let minDist = threshold;
+ let snapped = false;
  for (const tg of targets) {
   const d = Math.abs(rawTime - tg);
-  if (d < minDist) { minDist = d; best = roundT(tg); }
+  if (d < minDist) { minDist = d; best = roundT(tg); snapped = true; }
  }
- return best;
+ return { time: best, snapped };
 }
 
 function showSnapGuide(timeSec) {
  const canvas = document.getElementById('tlCanvas');
  if (!canvas) return;
+ const leftPx = Math.round(timeSec * appState.project.zoom);
  let guide = document.getElementById('snapGuideLine');
  if (!guide) {
   guide = document.createElement('div');
@@ -1866,7 +2912,22 @@ function showSnapGuide(timeSec) {
   guide.className = 'snap-guide';
   canvas.appendChild(guide);
  }
- guide.style.left = `${Math.round(timeSec * appState.project.zoom)}px`;
+ guide.style.left = `${leftPx}px`;
+
+ let badge = document.getElementById('snapGuideBadge');
+ if (!badge) {
+  badge = document.createElement('div');
+  badge.id = 'snapGuideBadge';
+  badge.className = 'snap-guide-badge';
+  canvas.appendChild(badge);
+ }
+ badge.textContent = `${fmtTimecode(timeSec)} · 磁吸对齐`;
+ badge.style.left = `${leftPx}px`;
+}
+
+function hideSnapGuide() {
+ document.getElementById('snapGuideLine')?.remove();
+ document.getElementById('snapGuideBadge')?.remove();
 }
 
 document.addEventListener('pointerdown', (e) => {
@@ -1890,7 +2951,7 @@ document.addEventListener('pointerdown', (e) => {
   stopPlayback();
   const clipId = clipEl.dataset.clipId;
   const track = clipEl.dataset.clipTrack;
-  const clip = (appState.project.tracks[track] || []).find((c) => c.id === clipId);
+  const clip = (appState.project.tracks?.[track] || []).find((c) => c.id === clipId);
   if (!clip) return;
   const mode = e.target.closest('.clip-handle-l') ? 'trim-l' : e.target.closest('.clip-handle-r') ? 'trim-r' : 'move';
   appState.dragState = {
@@ -1899,12 +2960,15 @@ document.addEventListener('pointerdown', (e) => {
    track,
    clipId,
    el: clipEl,
+   locked: isTrackLocked(appState.project, track),
+   warnedLocked: false,
+   ctrlOrShift: Boolean(e.ctrlKey || e.metaKey || e.shiftKey),
    startX: e.clientX,
    origStart: clip.start,
    origDur: clip.duration,
    moved: false,
    previewTime: clip.start,
-   snapshot: clone(appState.project)
+   snapshot: { label: mode === 'move' ? '移动片段位置' : '裁切片段时长', project: clone(appState.project) }
   };
  }
 });
@@ -1921,23 +2985,39 @@ document.addEventListener('pointermove', (e) => {
   const dx = e.clientX - d.startX;
   if (Math.abs(dx) > 3) d.moved = true;
   if (!d.moved) return;
+  if (d.locked) {
+   if (!d.warnedLocked) {
+    d.warnedLocked = true;
+    showToast('该轨道已锁定，请先点击轨道头锁图标解锁后再拖动');
+   }
+   return;
+  }
   const dt = dx / appState.project.zoom;
   if (d.mode === 'move') {
-   const nextStart = Math.max(0, snapTimeCandidate(d.origStart + dt, d.clipId));
-   d.previewStart = nextStart;
-   d.el.style.left = `${Math.round(nextStart * appState.project.zoom)}px`;
-   if (Math.abs(nextStart - roundT(Math.max(0, d.origStart + dt))) > 0.01) showSnapGuide(nextStart);
-   else document.getElementById('snapGuideLine')?.remove();
+   const rawStart = Math.max(0, d.origStart + dt);
+   const match = findSnapMatch(rawStart, d.clipId);
+   d.previewStart = match.time;
+   d.el.style.left = `${Math.round(match.time * appState.project.zoom)}px`;
+   if (match.snapped) showSnapGuide(match.time);
+   else hideSnapGuide();
   } else if (d.mode === 'trim-l') {
    const oldEnd = roundT(d.origStart + d.origDur);
-   const nextStart = Math.min(oldEnd - 0.5, Math.max(0, snapTimeCandidate(Math.max(0, Math.min(oldEnd - 0.5, d.origStart + dt)), d.clipId)));
+   const rawStart = Math.max(0, Math.min(oldEnd - 0.5, d.origStart + dt));
+   const match = findSnapMatch(rawStart, d.clipId);
+   const nextStart = Math.min(oldEnd - 0.5, Math.max(0, match.time));
    d.previewTime = nextStart;
    d.el.style.left = `${Math.round(nextStart * appState.project.zoom)}px`;
    d.el.style.width = `${Math.max(22, Math.round((oldEnd - nextStart) * appState.project.zoom))}px`;
+   if (match.snapped) showSnapGuide(nextStart);
+   else hideSnapGuide();
   } else {
-   const nextEnd = Math.max(d.origStart + 0.5, snapTimeCandidate(Math.max(d.origStart + 0.5, d.origStart + d.origDur + dt), d.clipId));
+   const rawEnd = Math.max(d.origStart + 0.5, d.origStart + d.origDur + dt);
+   const match = findSnapMatch(rawEnd, d.clipId);
+   const nextEnd = Math.max(d.origStart + 0.5, match.time);
    d.previewTime = nextEnd;
    d.el.style.width = `${Math.max(22, Math.round((nextEnd - d.origStart) * appState.project.zoom))}px`;
+   if (match.snapped) showSnapGuide(nextEnd);
+   else hideSnapGuide();
   }
  }
 });
@@ -1946,15 +3026,28 @@ document.addEventListener('pointerup', () => {
  const d = appState.dragState;
  if (!d) return;
  appState.dragState = null;
- document.getElementById('snapGuideLine')?.remove();
+ hideSnapGuide();
  if (d.kind === 'clip') {
-  if (!d.moved) {
-   appState.project.selected = { track: d.track, id: d.clipId };
+  if (!d.moved || d.locked) {
+   if (d.ctrlOrShift) {
+    const prevSel = appState.project.selected;
+    if (prevSel && !appState.multiSelected.some((m) => m.track === prevSel.track && m.id === prevSel.id)) {
+     appState.multiSelected.push({ track: prevSel.track, id: prevSel.id });
+    }
+    const idx = appState.multiSelected.findIndex((m) => m.track === d.track && m.id === d.clipId);
+    if (idx >= 0) appState.multiSelected.splice(idx, 1);
+    else appState.multiSelected.push({ track: d.track, id: d.clipId });
+    appState.project.selected = { track: d.track, id: d.clipId };
+   } else {
+    appState.multiSelected = [];
+    appState.project.selected = { track: d.track, id: d.clipId };
+   }
    scheduleSave();
    render();
    return;
   }
   pushUndo(d.snapshot);
+  appState.multiSelected = [];
   appState.project.selected = { track: d.track, id: d.clipId };
   if (d.mode === 'move') moveClip(appState.project, d.track, d.clipId, d.previewStart ?? d.origStart);
   else if (d.mode === 'trim-l') trimClip(appState.project, d.track, d.clipId, 'left', d.previewTime);
@@ -1967,9 +3060,15 @@ document.addEventListener('pointerup', () => {
 document.addEventListener('dragover', (e) => { if (e.dataTransfer?.types?.includes('Files')) e.preventDefault(); });
 document.addEventListener('drop', async (e) => {
  const file = e.dataTransfer?.files?.[0];
- if (!file || !/\.(json|jingxu\.json)$/i.test(file.name)) return;
+ if (!file || !/\.(json|jingxu\.json|jingxu2\.json)$/i.test(file.name)) return;
  e.preventDefault();
- try { await loadImportedText(await file.text()); } catch (err) { showToast(`拖入失败：${err.message}`); }
+ try {
+  const raw = await file.text();
+  if (!raw.trim()) throw new Error(`拖入的文件「${file.name}」内容为空。`);
+  await loadImportedText(raw);
+ } catch (err) {
+  showToast(`拖入失败：${err.message}`);
+ }
 });
 
 document.addEventListener('keydown', (e) => {
@@ -1977,27 +3076,50 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && appState.modal) { appState.modal = null; render(); }
   return;
  }
- const tag = document.activeElement?.tagName;
- const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+ const ae = document.activeElement;
+ const tag = ae?.tagName;
+ const isTextEntry = tag === 'TEXTAREA' || (tag === 'INPUT' && !['checkbox', 'radio', 'range', 'button', 'submit', 'file'].includes(ae?.type)) || ae?.isContentEditable;
 
- if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { if (typing) return; e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
- if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { if (typing) return; e.preventDefault(); redo(); return; }
+ if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { if (isTextEntry) return; e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+ if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { if (isTextEntry) return; e.preventDefault(); redo(); return; }
  if (e.key === 'Escape' && appState.modal) { appState.modal = null; render(); return; }
- if (typing) return;
+ if (isTextEntry || tag === 'SELECT' || appState.modal) return;
 
  if (e.code === 'Space') { e.preventDefault(); togglePlayback(); return; }
  if (e.key.toLowerCase() === 'b' || e.key.toLowerCase() === 's') {
   e.preventDefault();
+  const selTrack = appState.project.selected?.track;
+  if (selTrack && isTrackLocked(appState.project, selTrack)) { showToast('当前轨道已锁定，无法分割'); return; }
   stopPlayback();
-  pushUndo();
+  pushUndo(null, '快捷键分割');
   const res = splitAtPlayhead(appState.project);
   if (!res.ok) { appState.history.pop(); showToast(res.reason); }
   else { scheduleSave(); render(); showToast('已分割'); }
   return;
  }
  if (e.key === 'Delete' || e.key === 'Backspace') {
+  if (appState.multiSelected.length > 1) {
+   e.preventDefault();
+   stopPlayback();
+   pushUndo(null, '快捷键批量删除');
+   const res = deleteClips(appState.project, appState.multiSelected);
+   appState.multiSelected = [];
+   scheduleSave();
+   render();
+   showToast(`已删除 ${res.deletedCount} 个片段`);
+   return;
+  }
   const sel = appState.project.selected;
-  if (sel) { e.preventDefault(); stopPlayback(); pushUndo(); deleteClip(appState.project, sel.track, sel.id); scheduleSave(); render(); }
+  if (sel) {
+   e.preventDefault();
+   if (isTrackLocked(appState.project, sel.track)) { showToast('当前轨道已锁定，请先解锁再删除'); return; }
+   stopPlayback();
+   pushUndo(null, '快捷键删除');
+   deleteClip(appState.project, sel.track, sel.id);
+   appState.multiSelected = [];
+   scheduleSave();
+   render();
+  }
   return;
  }
  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {

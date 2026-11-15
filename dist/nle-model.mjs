@@ -4,6 +4,8 @@ import {
  SCENE_FIELDS,
  CLIP_PRESETS,
  NLE_DEMO_SEED,
+ TRACKS,
+ TRACK_MAP,
  VERSION
 } from './nle-catalog.mjs';
 
@@ -69,6 +71,19 @@ export function fmtFramesTimecode(sec, fps = 24) {
 }
 
 /**
+ * Advance continuous playback playhead without sub-frame quantization stalling.
+ */
+export function advancePlayhead(current, dt, totalDuration) {
+ const cur = Math.max(0, Number(current || 0));
+ const step = Math.max(0, Number(dt || 0));
+ const dur = Math.max(0, Number(totalDuration || 0));
+ if (dur <= 0) return { time: 0, ended: true };
+ const next = cur + step;
+ if (next >= dur) return { time: roundT(dur), ended: true };
+ return { time: next, ended: false };
+}
+
+/**
  * Parse aspect format string into numeric ratio parts for stage preview.
  */
 export function aspectRatioParts(format, customAspect = '') {
@@ -80,6 +95,149 @@ export function aspectRatioParts(format, customAspect = '') {
   if (w > 0 && h > 0) return { w, h, ratio: w / h, label: `${match[1]}:${match[2]}` };
  }
  return { w: 16, h: 9, ratio: 16 / 9, label: '16:9' };
+}
+
+/**
+ * Parse custom pixel resolution such as "2560x1080".
+ */
+export function parseCustomResolution(raw = '') {
+ const match = String(raw || '').trim().match(/^(\d{2,5})\s*[xX×*,\s]\s*(\d{2,5})$/);
+ if (match) {
+  const w = Math.max(64, Math.min(16384, Number(match[1])));
+  const h = Math.max(64, Math.min(16384, Number(match[2])));
+  return { w, h, label: `${w}x${h}`, valid: true };
+ }
+ return { w: 1920, h: 1080, label: '', valid: false };
+}
+
+/**
+ * Localized aspect ratio display string (never falls back to "Custom" in Chinese mode).
+ */
+export function displayAspectLabel(project, lang = 'zh') {
+ if (project?.format === 'custom') {
+  const raw = String(project.customAspect || '').trim();
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*[:xX/×]\s*(\d+(?:\.\d+)?)$/);
+  if (match && Number(match[1]) > 0 && Number(match[2]) > 0) {
+   return `${match[1]}:${match[2]}`;
+  }
+  return lang === 'en' ? 'Custom Ratio' : '自定义比例';
+ }
+ return aspectRatioParts(project?.format || '16:9', project?.customAspect).label;
+}
+
+/**
+ * Localized resolution display string.
+ */
+export function displayResolutionLabel(project, lang = 'zh') {
+ if (project?.resolution === 'custom') {
+  const parsed = parseCustomResolution(project?.customResolution);
+  if (parsed.valid) return parsed.label;
+  return lang === 'en' ? 'Custom Pixels' : '自定义像素';
+ }
+ return String(project?.resolution || '4K');
+}
+
+/**
+ * Parse custom negative prompt tags separated by commas, Chinese commas, or newlines.
+ */
+export function parseCustomNegativeTags(raw = '') {
+ const seen = new Set();
+ const out = [];
+ for (const part of String(raw || '').split(/[,，;；、\n\r]+/)) {
+  const clean = part.trim();
+  if (clean && !seen.has(clean)) {
+   seen.add(clean);
+   out.push(clean);
+  }
+ }
+ return out;
+}
+
+/**
+ * Map base or custom track key (`video_2`, `audio_2`, etc.) back to its track kind.
+ */
+export function trackKind(trackKey) {
+ if (TRACK_MAP[trackKey]) return trackKey;
+ const base = String(trackKey || '').split('_')[0];
+ if (TRACK_MAP[base]) return base;
+ return 'adjust';
+}
+
+/**
+ * Return ordered track descriptors combining the 5 core tracks and any extra custom tracks.
+ */
+export function getAllTracks(project) {
+ const extras = Array.isArray(project?.extraTracks) ? project.extraTracks : [];
+ const ordered = [];
+ for (const base of TRACKS) {
+  ordered.push({ ...base, isCustom: false });
+  for (const ex of extras) {
+   if (ex && ex.kind === base.key) {
+    ordered.push({ ...ex, isCustom: true });
+   }
+  }
+ }
+ return ordered;
+}
+
+/**
+ * Append a new custom extra track (`adjust`, `video`, `dialogue`, `audio`, `bgm`).
+ */
+export function addExtraTrack(project, kind = 'video') {
+ const base = TRACK_MAP[kind] || TRACK_MAP.video;
+ if (!project.tracks) project.tracks = {};
+ if (!Array.isArray(project.extraTracks)) project.extraTracks = [];
+ const sameKindCount = 1 + project.extraTracks.filter((x) => x.kind === base.key).length;
+ let n = sameKindCount + 1;
+ while (project.tracks[`${base.key}_${n}`]) n += 1;
+ const key = `${base.key}_${n}`;
+ const audioCount = 2 + project.extraTracks.filter((x) => x.kind === 'audio' || x.kind === 'bgm').length;
+ const code = base.key === 'audio' || base.key === 'bgm'
+  ? `A${audioCount + 1}`
+  : `${base.code[0]}${n}`;
+ const labelPrefix = base.key === 'video' ? '画中画 / 辅视频' : base.label.replace(/轨$/, '');
+ const track = {
+  key,
+  kind: base.key,
+  code,
+  label: `${labelPrefix} ${code}`,
+  short: base.short,
+  desc: base.desc,
+  accent: base.accent,
+  defaultDuration: base.defaultDuration,
+  isCustom: true
+ };
+ project.extraTracks.push(track);
+ project.tracks[key] = [];
+ project.updatedAt = Date.now();
+ return { project, track };
+}
+
+/**
+ * Remove a custom extra track (the 5 core tracks cannot be removed).
+ */
+export function removeExtraTrack(project, trackKey) {
+ if (TRACK_MAP[trackKey] || !Array.isArray(project?.extraTracks)) return { project, ok: false };
+ const idx = project.extraTracks.findIndex((x) => x.key === trackKey);
+ if (idx < 0) return { project, ok: false };
+ project.extraTracks.splice(idx, 1);
+ if (project.tracks) delete project.tracks[trackKey];
+ if (project.trackMeta) delete project.trackMeta[trackKey];
+ if (project.selected?.track === trackKey) project.selected = null;
+ project.updatedAt = Date.now();
+ return { project, ok: true };
+}
+
+export function isTrackLocked(project, trackKey) {
+ return Boolean(project?.trackMeta?.[trackKey]?.locked);
+}
+
+export function isTrackHidden(project, trackKey) {
+ return Boolean(project?.trackMeta?.[trackKey]?.hidden);
+}
+
+export function isTrackMuted(project, trackKey) {
+ return Boolean(project?.trackMeta?.[trackKey]?.muted);
 }
 
 /**
@@ -128,19 +286,27 @@ export function groupText(groupKey, id, lang = 'zh') {
  */
 export function defaultClipData(track, overrides = {}) {
  const o = overrides && typeof overrides === 'object' ? overrides : {};
+ const kind = trackKind(track);
  const start = roundT(Math.max(0, Number(o.start ?? 0)));
- const defaultDur = track === 'dialogue' ? 2.5 : track === 'audio' ? 2 : track === 'bgm' ? 8 : 4;
+ const defaultDur = kind === 'dialogue' ? 2.5 : kind === 'audio' ? 2 : kind === 'bgm' ? 8 : 4;
  const duration = roundT(Math.max(MIN_DURATION, Number(o.duration ?? defaultDur)));
- const prefix = track === 'video' ? 'v' : track === 'dialogue' ? 't' : track === 'audio' ? 'a' : track === 'bgm' ? 'b' : 'e';
+ const prefix = kind === 'video' ? 'v' : kind === 'dialogue' ? 't' : kind === 'audio' ? 'a' : kind === 'bgm' ? 'b' : 'e';
  const id = typeof o.id === 'string' && o.id ? o.id : uid(prefix);
 
- if (track === 'video') {
+ if (kind === 'video') {
+  const transIn = String(o.transitionIn ?? 'cut');
+  const transInMeta = groupItem('transition', transIn);
+  const defaultTransDur = transInMeta ? Number(transInMeta.dur || 0) : 0;
+  const transOut = String(o.transitionOut ?? '');
+  const transOutMeta = transOut ? groupItem('transition', transOut) : null;
+  const defaultOutDur = transOutMeta ? Number(transOutMeta.dur || 0) : 0;
   return {
    id,
    start,
    duration,
    title: String(o.title ?? '新分镜'),
    prompt: String(o.prompt ?? ''),
+   props: String(o.props ?? ''),
    startState: String(o.startState ?? ''),
    endState: String(o.endState ?? ''),
    framing: String(o.framing ?? 'wide'),
@@ -169,15 +335,19 @@ export function defaultClipData(track, overrides = {}) {
    sceneId: String(o.sceneId ?? ''),
    characterIds: Array.isArray(o.characterIds) ? [...o.characterIds] : [],
    characterActions: String(o.characterActions ?? ''),
-   transitionIn: String(o.transitionIn ?? 'cut'),
-   transitionDur: roundT(Math.max(0, Math.min(2, Number(o.transitionDur ?? 0.4)))),
+   transitionIn: transIn,
+   transitionDur: roundT(Math.max(0, Math.min(2, Number(o.transitionDur ?? defaultTransDur)))),
+   transitionOut: transOut,
+   transitionOutDur: roundT(Math.max(0, Math.min(2, Number(o.transitionOutDur ?? defaultOutDur)))),
    speedRate: Number(o.speedRate ?? 1) || 1,
-   refImage: String(o.refImage ?? ''),
+   refImage: String(o.refImage ?? o.startRefImage ?? ''),
+   startRefImage: String(o.startRefImage ?? o.refImage ?? ''),
+   endRefImage: String(o.endRefImage ?? ''),
    refNote: String(o.refNote ?? '')
   };
  }
 
- if (track === 'dialogue') {
+ if (kind === 'dialogue') {
   return {
    id,
    start,
@@ -186,11 +356,13 @@ export function defaultClipData(track, overrides = {}) {
    speakerName: String(o.speakerName ?? '主角'),
    language: String(o.language ?? '普通话'),
    delivery: String(o.delivery ?? ''),
+   subtitlePos: String(o.subtitlePos ?? 'bottom'),
+   subtitleStyle: String(o.subtitleStyle ?? ''),
    text: String(o.text ?? '')
   };
  }
 
- if (track === 'audio') {
+ if (kind === 'audio') {
   return {
    id,
    start,
@@ -204,7 +376,7 @@ export function defaultClipData(track, overrides = {}) {
   };
  }
 
- if (track === 'bgm') {
+ if (kind === 'bgm') {
   return {
    id,
    start,
@@ -256,6 +428,8 @@ export function createBlankProject(opts = {}) {
    audio: [],
    bgm: []
   },
+  extraTracks: Array.isArray(opts.extraTracks) ? clone(opts.extraTracks) : [],
+  trackMeta: opts.trackMeta && typeof opts.trackMeta === 'object' ? clone(opts.trackMeta) : {},
   negativePrompts: Array.isArray(opts.negativePrompts) ? [...opts.negativePrompts] : ['identity', 'flicker', 'watermark'],
   customNegative: String(opts.customNegative || ''),
   playhead: 0,
@@ -341,12 +515,13 @@ export function normalizeVideoTrack(project) {
  */
 export function normalizeAllTracks(project) {
  normalizeVideoTrack(project);
- for (const track of ['adjust', 'dialogue', 'audio', 'bgm']) {
-  const list = project?.tracks?.[track];
+ for (const tr of getAllTracks(project)) {
+  if (tr.key === 'video') continue;
+  const list = project?.tracks?.[tr.key];
   if (!Array.isArray(list)) continue;
   for (const clip of list) {
    clip.start = roundT(Math.max(0, Number(clip.start || 0)));
-   clip.duration = roundT(Math.max(MIN_DURATION, Number(clip.duration || 2)));
+   clip.duration = roundT(Math.max(MIN_DURATION, Number(clip.duration || tr.defaultDuration || 2)));
   }
   list.sort((a, b) => a.start - b.start);
  }
@@ -354,13 +529,13 @@ export function normalizeAllTracks(project) {
 }
 
 /**
- * Total timeline duration across all 5 tracks (0 when timeline is blank).
+ * Total timeline duration across all core and custom tracks (0 when timeline is blank).
  */
 export function projectDuration(project) {
  if (!project?.tracks) return 0;
  let maxEnd = 0;
- for (const key of ['adjust', 'video', 'dialogue', 'audio', 'bgm']) {
-  for (const clip of project.tracks[key] || []) {
+ for (const tr of getAllTracks(project)) {
+  for (const clip of project.tracks[tr.key] || []) {
    const end = roundT((clip.start || 0) + (clip.duration || 0));
    if (end > maxEnd) maxEnd = end;
   }
@@ -369,14 +544,80 @@ export function projectDuration(project) {
 }
 
 /**
- * Add a clip onto any track (`video`, `dialogue`, `audio`, `bgm`, `adjust`).
+ * Return true if the project has any clips, cast/scenes, or custom notes/tags.
+ */
+export function hasProjectContent(project) {
+ if (!project) return false;
+ if (hasExportableClips(project)) return true;
+ if ((project.characters || []).length > 0 || (project.scenes || []).length > 0) return true;
+ if (String(project.notes || '').trim() || String(project.customNegative || '').trim()) return true;
+ return false;
+}
+
+/**
+ * Return total clip count across all tracks.
+ */
+export function countProjectClips(project) {
+ if (!project?.tracks) return 0;
+ let n = 0;
+ for (const tr of getAllTracks(project)) {
+  n += (project.tracks[tr.key] || []).length;
+ }
+ return n;
+}
+
+/**
+ * Return true when at least one clip exists on the timeline.
+ */
+export function hasExportableClips(project) {
+ return countProjectClips(project) > 0;
+}
+
+/**
+ * Deep clone an entire project as a brand-new draft with a fresh ID and title suffix.
+ */
+export function cloneProject(project, suffix = ' (副本)') {
+ const copy = clone(project);
+ const now = Date.now();
+ copy.id = uid('proj');
+ delete copy.deletedAt;
+ copy.title = `${String(copy.title || '未命名草稿').replace(/\s*\(副本\d*\)$/, '')}${suffix}`;
+ copy.createdAt = now;
+ copy.updatedAt = now;
+ return copy;
+}
+
+/**
+ * Find next non-overlapping slot starting at/after `desiredStart` on a non-primary track.
+ */
+function findSequentialNonOverlappingStart(list, desiredStart, duration) {
+ let candidate = roundT(Math.max(0, desiredStart));
+ const sorted = [...(list || [])].sort((a, b) => a.start - b.start);
+ for (const existing of sorted) {
+  const exEnd = roundT(existing.start + existing.duration);
+  if (exEnd <= candidate + 0.01) continue;
+  const candEnd = roundT(candidate + duration);
+  // Collides with existing clip starting right at desired point or overlapping
+  if (Math.abs(existing.start - candidate) < 0.05 || (existing.start < candEnd - 0.01 && candidate < exEnd - 0.01)) {
+   candidate = exEnd;
+  }
+ }
+ return roundT(candidate);
+}
+
+/**
+ * Add a clip onto any track (`video`, `dialogue`, `audio`, `bgm`, `adjust`, or extra custom tracks).
  */
 export function addClip(project, track, spec = {}, options = {}) {
- if (!project?.tracks || !Array.isArray(project.tracks[track])) {
-  throw new Error(`Unsupported track: ${track}`);
+ if (!project?.tracks) project.tracks = {};
+ if (!Array.isArray(project.tracks[track])) {
+  const isCustom = (project.extraTracks || []).some((t) => t.key === track);
+  if (isCustom) project.tracks[track] = [];
+  else throw new Error(`Unsupported track: ${track}`);
  }
- let desiredStart = options.atStart;
- if (desiredStart === undefined) {
+ const hasExplicitStart = options.atStart !== undefined || (spec && spec.start !== undefined && spec.start !== null);
+ let desiredStart = options.atStart ?? spec?.start;
+ if (desiredStart === undefined || desiredStart === null) {
   if (track === 'video') {
    if (options.atPlayhead) {
     desiredStart = roundT(Math.max(0, project.playhead || 0));
@@ -389,7 +630,13 @@ export function addClip(project, track, spec = {}, options = {}) {
   }
  }
  desiredStart = roundT(Math.max(0, Number(desiredStart) || 0));
+ const initialDesired = desiredStart;
  const clip = defaultClipData(track, { ...clone(spec), start: desiredStart });
+
+ if (track !== 'video' && !hasExplicitStart && !options.allowStack && project.tracks[track].length) {
+  const nextPos = findSequentialNonOverlappingStart(project.tracks[track], desiredStart, clip.duration);
+  clip.start = nextPos;
+ }
 
  if (track === 'video' && options.atPlayhead && project.tracks.video.length) {
   // Make room on V1 when inserting mid-timeline at playhead
@@ -404,7 +651,7 @@ export function addClip(project, track, spec = {}, options = {}) {
  normalizeAllTracks(project);
  project.selected = { track, id: clip.id };
  project.updatedAt = Date.now();
- return { project, clip };
+ return { project, clip, shifted: track !== 'video' && Math.abs(clip.start - initialDesired) > 0.05 };
 }
 
 /**
@@ -438,15 +685,19 @@ export function splitClipAt(project, track, clipId, splitTime) {
  }
 
  orig.duration = leftDur;
+ const kind = trackKind(track);
  const rightCopy = clone(orig);
- rightCopy.id = uid(track === 'video' ? 'v' : track === 'dialogue' ? 't' : track === 'audio' ? 'a' : track === 'bgm' ? 'b' : 'e');
+ rightCopy.id = uid(kind === 'video' ? 'v' : kind === 'dialogue' ? 't' : kind === 'audio' ? 'a' : kind === 'bgm' ? 'b' : 'e');
  rightCopy.start = cut;
  rightCopy.duration = rightDur;
 
- if (track === 'video') {
+ if (kind === 'video') {
   const baseTitle = (orig.title || '分镜').replace(/\s*\(续\d*\)$/, '');
   rightCopy.title = `${baseTitle} (续)`;
   rightCopy.transitionIn = 'cut';
+  rightCopy.transitionDur = 0;
+  orig.transitionOut = '';
+  orig.transitionOutDur = 0;
  }
 
  list.splice(idx + 1, 0, rightCopy);
@@ -462,15 +713,19 @@ export function splitClipAt(project, track, clipId, splitTime) {
 export function splitAtPlayhead(project) {
  const t = roundT(project.playhead || 0);
  if (project.selected?.track && project.selected?.id) {
+  if (isTrackLocked(project, project.selected.track)) {
+   return { project, ok: false, reason: '所在轨道已锁定，请先解锁再分割' };
+  }
   const target = (project.tracks[project.selected.track] || []).find((c) => c.id === project.selected.id);
   if (target && t > target.start && t < roundT(target.start + target.duration)) {
    return splitClipAt(project, project.selected.track, target.id, t);
   }
  }
- for (const track of ['video', 'dialogue', 'audio', 'bgm', 'adjust']) {
-  const hit = (project.tracks[track] || []).find((c) => t > c.start && t < roundT(c.start + c.duration));
+ for (const tr of getAllTracks(project)) {
+  if (isTrackLocked(project, tr.key)) continue;
+  const hit = (project.tracks[tr.key] || []).find((c) => t > c.start && t < roundT(c.start + c.duration));
   if (hit) {
-   return splitClipAt(project, track, hit.id, t);
+   return splitClipAt(project, tr.key, hit.id, t);
   }
  }
  return { project, ok: false, reason: '当前播放头位置没有可分割的片段（请先把红线移到片段中间）' };
@@ -591,15 +846,18 @@ export function duplicateClip(project, track, clipId) {
  const orig = list.find((c) => c.id === clipId);
  if (!orig) return { project, clip: null };
 
+ const kind = trackKind(track);
  const copy = clone(orig);
- copy.id = uid(track === 'video' ? 'v' : track === 'dialogue' ? 't' : track === 'audio' ? 'a' : track === 'bgm' ? 'b' : 'e');
+ copy.id = uid(kind === 'video' ? 'v' : kind === 'dialogue' ? 't' : kind === 'audio' ? 'a' : kind === 'bgm' ? 'b' : 'e');
  copy.start = roundT(orig.start + orig.duration);
- if (track === 'video') {
+ if (kind === 'video') {
   copy.title = `${orig.title || '分镜'} (副本)`;
   copy.transitionIn = 'cut';
-  for (const item of list) {
-   if (item.start >= copy.start) {
-    item.start = roundT(item.start + copy.duration);
+  if (track === 'video') {
+   for (const item of list) {
+    if (item.start >= copy.start) {
+     item.start = roundT(item.start + copy.duration);
+    }
    }
   }
  }
@@ -608,6 +866,67 @@ export function duplicateClip(project, track, clipId) {
  project.selected = { track, id: copy.id };
  project.updatedAt = Date.now();
  return { project, clip: copy };
+}
+
+/**
+ * Batch delete multiple `{ track, id }` items cleanly (skipping locked tracks).
+ */
+export function deleteClips(project, items = []) {
+ let deletedCount = 0;
+ for (const item of items) {
+  if (!item?.track || !item?.id || isTrackLocked(project, item.track)) continue;
+  const list = project?.tracks?.[item.track];
+  if (!Array.isArray(list)) continue;
+  const idx = list.findIndex((c) => c.id === item.id);
+  if (idx >= 0) {
+   list.splice(idx, 1);
+   deletedCount += 1;
+  }
+ }
+ if (deletedCount > 0) {
+  normalizeAllTracks(project);
+  if (project.selected && !((project.tracks?.[project.selected.track] || []).some((c) => c.id === project.selected.id))) {
+   const firstV = project.tracks?.video?.[0];
+   project.selected = firstV ? { track: 'video', id: firstV.id } : null;
+  }
+  project.updatedAt = Date.now();
+ }
+ return { project, deletedCount };
+}
+
+/**
+ * Batch update duration across selected `{ track, id }` items (respecting MIN_DURATION and ripple).
+ */
+export function batchUpdateClipDuration(project, items = [], newDuration) {
+ const dur = roundT(Math.max(MIN_DURATION, Number(newDuration) || 2));
+ let updatedCount = 0;
+ for (const item of items) {
+  if (!item?.track || !item?.id || isTrackLocked(project, item.track)) continue;
+  const clip = (project?.tracks?.[item.track] || []).find((c) => c.id === item.id);
+  if (clip) {
+   clip.duration = dur;
+   updatedCount += 1;
+  }
+ }
+ if (updatedCount > 0) {
+  normalizeAllTracks(project);
+  project.updatedAt = Date.now();
+ }
+ return { project, updatedCount, duration: dur };
+}
+
+function gatherClipsByKind(project, kind, { skipHidden = false, skipMuted = false, includePrimaryVideo = true } = {}) {
+ const list = [];
+ for (const tr of getAllTracks(project)) {
+  if (tr.kind !== kind && trackKind(tr.key) !== kind) continue;
+  if (!includePrimaryVideo && tr.key === 'video') continue;
+  if (skipHidden && isTrackHidden(project, tr.key)) continue;
+  if (skipMuted && isTrackMuted(project, tr.key)) continue;
+  for (const clip of project?.tracks?.[tr.key] || []) {
+   list.push({ ...clip, _trackCode: tr.code, _trackKey: tr.key });
+  }
+ }
+ return list.sort((a, b) => a.start - b.start);
 }
 
 /**
@@ -622,10 +941,12 @@ export function stateAtTime(project, t) {
   return totalDuration > 0 && clamped === totalDuration && end === totalDuration;
  };
 
+ const vHidden = isTrackHidden(project, 'video');
  const videos = project?.tracks?.video || [];
- const videoIdx = videos.findIndex(isActive);
+ const videoIdx = vHidden ? -1 : videos.findIndex(isActive);
  const video = videoIdx >= 0 ? videos[videoIdx] : null;
  const prevVideo = videoIdx > 0 ? videos[videoIdx - 1] : null;
+ const pipVideos = gatherClipsByKind(project, 'video', { skipHidden: true, includePrimaryVideo: false }).filter(isActive);
 
  let transitionActive = null;
  if (video && video.transitionIn && video.transitionIn !== 'cut' && video.transitionDur > 0) {
@@ -639,13 +960,13 @@ export function stateAtTime(project, t) {
   }
  }
 
- const dialogues = (project?.tracks?.dialogue || []).filter(isActive);
- const audios = (project?.tracks?.audio || []).filter(isActive);
- const bgms = (project?.tracks?.bgm || []).filter(isActive).map((b) => ({
+ const dialogues = gatherClipsByKind(project, 'dialogue', { skipHidden: true, skipMuted: true }).filter(isActive);
+ const audios = gatherClipsByKind(project, 'audio', { skipMuted: true }).filter(isActive);
+ const bgms = gatherClipsByKind(project, 'bgm', { skipMuted: true }).filter(isActive).map((b) => ({
   ...b,
   isDucking: Boolean(b.duckUnderDialogue && dialogues.length > 0)
  }));
- const adjusts = (project?.tracks?.adjust || []).filter(isActive);
+ const adjusts = gatherClipsByKind(project, 'adjust', { skipHidden: true }).filter(isActive);
 
  let effectiveVisual = video ? clone(video) : null;
  if (effectiveVisual && adjusts.length) {
@@ -667,6 +988,7 @@ export function stateAtTime(project, t) {
   totalDuration,
   video,
   prevVideo,
+  pipVideos,
   transitionActive,
   dialogues,
   audios,
@@ -743,6 +1065,19 @@ export function validateTimeline(project) {
     track: 'dialogue',
     clipId: d.id,
     message: `T1 对白（${fmtTimecode(d.start)}）下方没有对应的 V1 视频镜头覆盖。`
+   });
+  }
+ }
+
+ const allVids = gatherClipsByKind(project, 'video', { includePrimaryVideo: true });
+ const boundScenes = new Set(allVids.map((v) => v.sceneId).filter(Boolean));
+ for (const sc of project?.scenes || []) {
+  if (!boundScenes.has(sc.id)) {
+   issues.push({
+    severity: 'info',
+    track: 'video',
+    clipId: videos[0]?.id || null,
+    message: `场景「${sc.name || '未命名场景'}」尚未绑定到任何 V1 分镜，建议在分镜参数中绑定场景锚点。`
    });
   }
  }
@@ -875,6 +1210,41 @@ export function convertV1ToV2(v1Raw) {
  return proj;
 }
 
+export function createBlankTemplateJson(kind = 'v2') {
+ if (kind === 'v1') {
+  return JSON.stringify({
+   version: 1,
+   title: '镜序 1.0 空白分镜导入模板',
+   format: '16:9',
+   resolution: '4K',
+   fps: 24,
+   bgm: 'warm_piano',
+   characters: [
+    { id: 'c1', name: '主角', role: '主角', lockIdentity: true, appearance: '青年，深色风衣' }
+   ],
+   scenes: [
+    { id: 's1', name: '主场景', description: '城市街头黄昏光影' }
+   ],
+   shots: [
+    {
+     id: 'sh1',
+     title: '分镜 01（示例可修改）',
+     duration: 4,
+     framing: 'wide',
+     move: 'push',
+     style: 'cinema_realism',
+     characterIds: ['c1'],
+     sceneId: 's1',
+     prompt: '在此填写画面主体动作描述',
+     dialogue: '',
+     sfx: ''
+    }
+   ]
+  }, null, 2);
+ }
+ return JSON.stringify(createBlankProject({ title: '镜序 2.0 空白工程模板' }), null, 2);
+}
+
 /**
  * Parse either a Jingxu 2.0 multi-track JSON or a Jingxu 1.0 `.jingxu.json` export.
  */
@@ -882,11 +1252,15 @@ export function parseAnyProjectImport(textOrObj, { rekey = true } = {}) {
  let parsed = textOrObj;
  if (typeof textOrObj === 'string') {
   const clean = textOrObj.replace(/^\uFEFF/, '').trim();
-  if (!clean) throw new Error('导入内容为空，请粘贴或选择有效的 JSON 工程文件。');
-  parsed = JSON.parse(clean);
+  if (!clean) throw new Error('导入内容为空：请先粘贴 JSON 文本或选择本地 .jingxu.json / .jingxu2.json 文件。');
+  try {
+   parsed = JSON.parse(clean);
+  } catch {
+   throw new Error('JSON 格式解析失败：请确认粘贴的是完整的 .json 工程文件（检查大括号与引号是否完整，切勿传入纯文本）。');
+  }
  }
  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-  throw new Error('无效的工程结构：根节点必须是 JSON 对象。');
+  throw new Error('工程结构无效：文件根节点必须是 JSON 对象（{ ... }）。');
  }
 
  const safe = sanitizeImportedObject(parsed);
@@ -902,6 +1276,8 @@ export function parseAnyProjectImport(textOrObj, { rekey = true } = {}) {
    customResolution: safe.customResolution || '',
    fps: safe.fps || 24,
    notes: safe.notes || '',
+   extraTracks: Array.isArray(safe.extraTracks) ? safe.extraTracks : [],
+   trackMeta: safe.trackMeta && typeof safe.trackMeta === 'object' ? safe.trackMeta : {},
    negativePrompts: Array.isArray(safe.negativePrompts) ? safe.negativePrompts : ['identity', 'flicker', 'watermark'],
    customNegative: safe.customNegative || '',
    zoom: safe.zoom || 72,
@@ -925,17 +1301,20 @@ export function parseAnyProjectImport(textOrObj, { rekey = true } = {}) {
    proj.scenes.push({ ...clone(s), id: nextId });
   }
 
-  for (const track of ['video', 'dialogue', 'audio', 'bgm', 'adjust']) {
+  const extraKeys = (proj.extraTracks || []).map((t) => t.key);
+  for (const track of ['video', 'dialogue', 'audio', 'bgm', 'adjust', ...extraKeys]) {
+   if (!Array.isArray(proj.tracks[track])) proj.tracks[track] = [];
    for (const item of Array.isArray(safe.tracks[track]) ? safe.tracks[track] : []) {
     const nextItem = clone(item);
     if (rekey) delete nextItem.id;
-    if (track === 'video') {
+    const kind = trackKind(track);
+    if (kind === 'video') {
      if (nextItem.sceneId && sceneMap.has(nextItem.sceneId)) nextItem.sceneId = sceneMap.get(nextItem.sceneId);
      if (Array.isArray(nextItem.characterIds)) {
       nextItem.characterIds = nextItem.characterIds.map((id) => charMap.get(id) || id);
      }
     }
-    if (track === 'dialogue' && nextItem.speakerId && charMap.has(nextItem.speakerId)) {
+    if (kind === 'dialogue' && nextItem.speakerId && charMap.has(nextItem.speakerId)) {
      nextItem.speakerId = charMap.get(nextItem.speakerId);
     }
     proj.tracks[track].push(defaultClipData(track, nextItem));
@@ -952,7 +1331,7 @@ export function parseAnyProjectImport(textOrObj, { rekey = true } = {}) {
   return convertV1ToV2(safe);
  }
 
- throw new Error('无法识别的工程格式：请导入镜序 2.0 工程 JSON 或镜序 1.0 (.jingxu.json) 文件。');
+ throw new Error('未能识别的工程格式：请确认导入的是镜序 2.0 (.jingxu2.json) 多轨工程或 1.0 (.jingxu.json) 分镜工程。');
 }
 
 function buildCastLines(project, lang) {
@@ -967,6 +1346,9 @@ function buildCastLines(project, lang) {
    if (!val || key === 'name') continue;
    const label = lang === 'en' ? key : labelZh;
    parts.push(`${label}:${val}`);
+  }
+  if (c.refImage) {
+   parts.push(`${lang === 'en' ? 'RefSheet' : '三视图/参考图'}:${c.refImage.startsWith('data:') ? '[已挂载本地定妆图]' : c.refImage}`);
   }
   return `- ${c.name || (lang === 'en' ? 'Character' : '角色')}${c.lockIdentity ? (lang === 'en' ? ' [ID LOCK]' : ' [身份锁定]') : ''}: ${parts.join(' | ')}`;
  });
@@ -995,7 +1377,7 @@ function buildSceneLines(project, lang) {
  return (lang === 'en' ? '[Scene Anchors]\n' : '【场景空间锚点】\n') + lines.join('\n');
 }
 
-function formatVideoDescriptor(clip, adjusts, project, lang) {
+function formatVideoDescriptor(clip, adjusts, project, lang, shotIndex = -1) {
  const sep = lang === 'en' ? ', ' : '；';
  const eff = clone(clip);
  for (const adj of adjusts) {
@@ -1010,6 +1392,7 @@ function formatVideoDescriptor(clip, adjusts, project, lang) {
   groupText('composition', eff.composition, lang),
   groupText('move', eff.move, lang),
   eff.move && eff.move !== 'stationary' && eff.move !== 'fixed' ? groupText('speed', eff.speed, lang) : '',
+  eff.moveDistance ? (lang === 'en' ? `Move distance: ${eff.moveDistance}` : `运镜幅度：${eff.moveDistance}`) : '',
   groupText('stability', eff.stability, lang),
   groupText('lens', eff.lens, lang),
   groupText('focus', eff.focus, lang)
@@ -1034,6 +1417,7 @@ function formatVideoDescriptor(clip, adjusts, project, lang) {
  const segments = [];
  if (scene) segments.push((lang === 'en' ? `Scene: ` : `场景：`) + scene.name + (scene.location ? ` (${scene.location})` : ''));
  if (chars.length) segments.push((lang === 'en' ? `Subjects: ` : `出镜角色：`) + chars.map((c) => c.name).join('、'));
+ if (eff.props) segments.push((lang === 'en' ? `Props: ` : `关键道具：`) + eff.props);
  if (eff.prompt) segments.push(eff.prompt);
  if (eff.characterActions) segments.push((lang === 'en' ? `Action: ` : `动作细节：`) + eff.characterActions);
  if (eff.startState) segments.push((lang === 'en' ? `Start frame: ` : `起幅状态：`) + eff.startState);
@@ -1047,34 +1431,79 @@ function formatVideoDescriptor(clip, adjusts, project, lang) {
  const adjNotes = adjusts.map((a) => [a.cameraModifier, a.slowMo].filter(Boolean).join(sep)).filter(Boolean);
  if (adjNotes.length) segments.push((lang === 'en' ? `Adjustment Layer: ` : `调节层覆写：`) + adjNotes.join(sep));
 
- if (eff.transitionIn && eff.transitionIn !== 'cut') {
-  segments.push((lang === 'en' ? `In Transition: ` : `入画转场：`) + `${groupText('transition', eff.transitionIn, lang)} (${eff.transitionDur}s)`);
+ if (eff.transitionIn && (eff.transitionIn !== 'cut' || shotIndex > 0)) {
+  const durTag = eff.transitionDur > 0 ? ` (${eff.transitionDur}s)` : (eff.transitionIn === 'cut' || eff.transitionIn === 'direct_cut' ? ' (0s)' : '');
+  segments.push((lang === 'en' ? `In Transition: ` : `入画转场：`) + `${groupText('transition', eff.transitionIn, lang)}${durTag}`);
+ }
+ if (eff.transitionOut && eff.transitionOut !== 'none') {
+  const outDurTag = eff.transitionOutDur > 0 ? ` (${eff.transitionOutDur}s)` : '';
+  segments.push((lang === 'en' ? `Out Transition: ` : `出画转场：`) + `${groupText('transition', eff.transitionOut, lang)}${outDurTag}`);
+ }
+ const startRef = eff.startRefImage || eff.refImage || '';
+ if (startRef) {
+  segments.push((lang === 'en' ? 'Start Frame Ref: ' : '首帧参考：') + (startRef.startsWith('data:') ? '[已挂载本地首帧参考图]' : startRef));
+ }
+ if (eff.endRefImage) {
+  segments.push((lang === 'en' ? 'End Frame Ref: ' : '尾帧参考：') + (eff.endRefImage.startsWith('data:') ? '[已挂载本地尾帧参考图]' : eff.endRefImage));
  }
 
  return segments.join(sep);
 }
 
-function formatAudioSummary(dialogues, audios, bgms, lang) {
+function dedupeByKey(list, keyFn) {
+ const seen = new Set();
+ const out = [];
+ for (const item of list || []) {
+  const k = keyFn(item);
+  if (seen.has(k)) continue;
+  seen.add(k);
+  out.push(item);
+ }
+ return out;
+}
+
+const SUBTITLE_POS_ZH = { bottom: '底部字幕', top: '顶部字幕', center: '画面居中', off: '仅配音无字幕' };
+
+function formatAudioSummary(dialogues, audios, bgms, lang, seenCrossShot = null) {
  const lines = [];
- for (const d of dialogues) {
+ const uniqDlg = dedupeByKey(dialogues, (d) => `${roundT(d.start)}|${roundT(d.duration)}|${String(d.speakerName || '').trim()}|${String(d.text || '').trim()}`);
+ for (const d of uniqDlg) {
+  const code = d._trackCode || 'T1';
+  if (seenCrossShot && seenCrossShot.has(d.id)) {
+   continue;
+  }
+  if (seenCrossShot) seenCrossShot.add(d.id);
   const who = d.speakerName || (lang === 'en' ? 'Speaker' : '角色');
   const tag = d.delivery ? ` [${d.delivery}]` : '';
   const lyr = d.language ? ` (${d.language})` : '';
+  const subMeta = [d.subtitlePos && d.subtitlePos !== 'bottom' ? (SUBTITLE_POS_ZH[d.subtitlePos] || d.subtitlePos) : '', d.subtitleStyle].filter(Boolean).join(' · ');
+  const subTag = subMeta ? ` {${subMeta}}` : '';
   lines.push(lang === 'en'
-   ? `  T1 Dialogue [${fmtTimecode(d.start)}-${fmtTimecode(roundT(d.start + d.duration))}] ${who}${lyr}${tag}: ${d.text || '(silent)'}`
-   : `  T1 对白 [${fmtTimecode(d.start)}-${fmtTimecode(roundT(d.start + d.duration))}] ${who}${lyr}${tag}：${d.text || '（留白）'}`);
+   ? `  ${code} Dialogue [${fmtTimecode(d.start)}-${fmtTimecode(roundT(d.start + d.duration))}] ${who}${lyr}${tag}${subTag}: ${d.text || '(silent)'}`
+   : `  ${code} 对白 [${fmtTimecode(d.start)}-${fmtTimecode(roundT(d.start + d.duration))}] ${who}${lyr}${tag}${subTag}：${d.text || '（留白）'}`);
  }
- for (const a of audios) {
+ const uniqAud = dedupeByKey(audios, (a) => `${roundT(a.start)}|${roundT(a.duration)}|${a.kind}|${String(a.cue || '').trim()}`);
+ for (const a of uniqAud) {
+  const code = a._trackCode || 'A1';
+  if (seenCrossShot && seenCrossShot.has(a.id)) continue;
+  if (seenCrossShot) seenCrossShot.add(a.id);
+  const fades = [a.fadeIn > 0 ? `淡入${a.fadeIn}s` : '', a.fadeOut > 0 ? `淡出${a.fadeOut}s` : '', a.spatial || ''].filter(Boolean).join('/');
+  const metaStr = [a.intensity, fades].filter(Boolean).join(' · ');
   lines.push(lang === 'en'
-   ? `  A1 ${a.kind === 'ambience' ? 'Ambience' : 'SFX'} [${fmtTimecode(a.start)}-${fmtTimecode(roundT(a.start + a.duration))}]: ${a.cue}${a.intensity ? ` (${a.intensity})` : ''}`
-   : `  A1 ${a.kind === 'ambience' ? '环境音' : '音效'} [${fmtTimecode(a.start)}-${fmtTimecode(roundT(a.start + a.duration))}]：${a.cue}${a.intensity ? `（${a.intensity}）` : ''}`);
+   ? `  ${code} ${a.kind === 'ambience' ? 'Ambience' : 'SFX'} [${fmtTimecode(a.start)}-${fmtTimecode(roundT(a.start + a.duration))}]: ${a.cue}${metaStr ? ` (${metaStr})` : ''}`
+   : `  ${code} ${a.kind === 'ambience' ? '环境音' : '音效'} [${fmtTimecode(a.start)}-${fmtTimecode(roundT(a.start + a.duration))}]：${a.cue}${metaStr ? `（${metaStr}）` : ''}`);
  }
- for (const b of bgms) {
-  const duck = b.duckUnderDialogue && dialogues.length ? (lang === 'en' ? ' [Auto-Duck under Dialogue]' : ' [人声避让压低]') : '';
+ const uniqBgm = dedupeByKey(bgms, (b) => `${roundT(b.start)}|${roundT(b.duration)}|${b.style}|${String(b.mood || '').trim()}`);
+ for (const b of uniqBgm) {
+  const code = b._trackCode || 'A2';
+  if (seenCrossShot && seenCrossShot.has(b.id)) continue;
+  if (seenCrossShot) seenCrossShot.add(b.id);
+  const duck = b.duckUnderDialogue && uniqDlg.length ? (lang === 'en' ? ' [Auto-Duck under Dialogue]' : ' [人声避让压低]') : '';
   const styleText = groupText('bgm', b.style, lang);
+  const fades = [b.fadeIn > 0 ? `淡入${b.fadeIn}s` : '', b.fadeOut > 0 ? `淡出${b.fadeOut}s` : ''].filter(Boolean).join('/');
   lines.push(lang === 'en'
-   ? `  A2 BGM [${fmtTimecode(b.start)}-${fmtTimecode(roundT(b.start + b.duration))}]${duck}: ${[styleText, b.mood, b.customNote].filter(Boolean).join(' · ')}`
-   : `  A2 配乐 [${fmtTimecode(b.start)}-${fmtTimecode(roundT(b.start + b.duration))}]${duck}：${[styleText, b.mood, b.customNote].filter(Boolean).join(' · ')}`);
+   ? `  ${code} BGM [${fmtTimecode(b.start)}-${fmtTimecode(roundT(b.start + b.duration))}]${duck}: ${[styleText, b.mood, b.customNote, fades].filter(Boolean).join(' · ')}`
+   : `  ${code} 配乐 [${fmtTimecode(b.start)}-${fmtTimecode(roundT(b.start + b.duration))}]${duck}：${[styleText, b.mood, b.customNote, fades].filter(Boolean).join(' · ')}`);
  }
  return lines;
 }
@@ -1092,21 +1521,29 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
  const m = mode || project?.outputMode || 'storyboard';
  const l = lang || project?.outputLang || 'zh';
  const total = projectDuration(project);
- const videos = project?.tracks?.video || [];
+ const videos = isTrackHidden(project, 'video') ? [] : (project?.tracks?.video || []);
 
- if (!videos.length && !(project?.tracks?.dialogue?.length || project?.tracks?.audio?.length || project?.tracks?.bgm?.length)) {
+ if (!hasExportableClips(project)) {
   return l === 'en'
    ? '[00:00 Empty Timeline] Add clips on V1 / T1 / A1 / A2 / E1 to compile a multi-track prompt.'
-   : '【00:00 空白时间轴】请在下方轨道添加 V1 分镜 / T1 对白 / A1 音效 / A2 配乐 / E1 调节层片段，此处将实时编译时间轴提示词。';
+   : '【00:00 空白时间轴】请在下方轨道至少添加一个 V1 分镜 / T1 对白 / A1 音效 / A2 配乐 / E1 调节层片段，此处将实时编译时间轴提示词。';
  }
 
- const aspect = aspectRatioParts(project.format, project.customAspect).label;
- const res = project.resolution === 'custom' ? (project.customResolution || 'Custom') : project.resolution;
+ const aspect = displayAspectLabel(project, l);
+ const res = displayResolutionLabel(project, l);
+ const negAdjust = gatherClipsByKind(project, 'adjust', { skipHidden: true }).map((a) => a.negativeOverride).filter(Boolean);
+ const negCustom = parseCustomNegativeTags(project.customNegative);
  const negs = [
   ...(project.negativePrompts || []).map((id) => groupText('negative', id, l)).filter(Boolean),
-  ...(project.tracks?.adjust || []).map((a) => a.negativeOverride).filter(Boolean),
-  project.customNegative || ''
+  ...negAdjust,
+  ...negCustom
  ].filter(Boolean).join(l === 'en' ? ', ' : '、');
+
+ const allAdjust = gatherClipsByKind(project, 'adjust', { skipHidden: true });
+ const allDlg = gatherClipsByKind(project, 'dialogue', { skipHidden: true, skipMuted: true });
+ const allAud = gatherClipsByKind(project, 'audio', { skipMuted: true });
+ const allBgm = gatherClipsByKind(project, 'bgm', { skipMuted: true });
+ const pipVideos = gatherClipsByKind(project, 'video', { skipHidden: true, includePrimaryVideo: false });
 
  if (m === 'table') {
   const header = ['Track/Shot', 'Start', 'End', 'Duration(s)', 'Camera & Look', 'Visual / Cue', 'Adjustments & Transitions', 'Dialogue'];
@@ -1114,8 +1551,8 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
   videos.forEach((v, idx) => {
    const end = roundT(v.start + v.duration);
    const overlaps = (arr) => (arr || []).filter((x) => x.start < end && roundT(x.start + x.duration) > v.start);
-   const adj = overlaps(project.tracks.adjust);
-   const dlg = overlaps(project.tracks.dialogue);
+   const adj = overlaps(allAdjust);
+   const dlg = dedupeByKey(overlaps(allDlg), (d) => `${roundT(d.start)}|${d.speakerName}|${d.text}`);
    rows.push([
     `V1-${idx + 1} ${v.title || ''}`.trim(),
     fmtTimecode(v.start),
@@ -1133,29 +1570,30 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
  if (m === 'selected' && project.selected) {
   const { track, id } = project.selected;
   const clip = (project.tracks?.[track] || []).find((c) => c.id === id);
+  const kind = trackKind(track);
   if (clip) {
    const end = roundT(clip.start + clip.duration);
-   if (track === 'video') {
-    const adj = (project.tracks.adjust || []).filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
-    const dlg = (project.tracks.dialogue || []).filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
-    const aud = (project.tracks.audio || []).filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
-    const bgm = (project.tracks.bgm || []).filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
+   if (kind === 'video') {
+    const adj = allAdjust.filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
+    const dlg = allDlg.filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
+    const aud = allAud.filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
+    const bgm = allBgm.filter((x) => x.start < end && roundT(x.start + x.duration) > clip.start);
     return [
      `[${fmtTimecode(clip.start)} - ${fmtTimecode(end)} · ${clip.duration}s] ${clip.title}`,
      formatVideoDescriptor(clip, adj, project, l),
      ...formatAudioSummary(dlg, aud, bgm, l)
     ].filter(Boolean).join('\n');
    }
-   if (track === 'dialogue') {
+   if (kind === 'dialogue') {
     return `[T1 ${fmtTimecode(clip.start)}-${fmtTimecode(end)}] ${clip.speakerName} (${clip.language}${clip.delivery ? `, ${clip.delivery}` : ''}): ${clip.text}`;
    }
-   if (track === 'audio') {
+   if (kind === 'audio') {
     return `[A1 ${clip.kind.toUpperCase()} ${fmtTimecode(clip.start)}-${fmtTimecode(end)}] ${clip.cue} (${clip.intensity})`;
    }
-   if (track === 'bgm') {
+   if (kind === 'bgm') {
     return `[A2 BGM ${fmtTimecode(clip.start)}-${fmtTimecode(end)}] ${groupText('bgm', clip.style, l)} ${clip.mood}${clip.duckUnderDialogue ? ' [Ducking]' : ''}`;
    }
-   if (track === 'adjust') {
+   if (kind === 'adjust') {
     return `[E1 ADJUST ${fmtTimecode(clip.start)}-${fmtTimecode(end)}] ${clip.label} | ${[groupText('look', clip.lookOverride, l), groupText('color', clip.colorOverride, l), groupText('lightSource', clip.lightOverride, l), clip.cameraModifier].filter(Boolean).join(' / ')}`;
    }
   }
@@ -1172,12 +1610,14 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
  if (sceneLines) sections.push(sceneLines);
 
  if (m === 'concise') {
+  const seenDlg = new Set();
   const seq = videos.map((v, idx) => {
    const end = roundT(v.start + v.duration);
-   const adj = (project.tracks.adjust || []).filter((x) => x.start < end && roundT(x.start + x.duration) > v.start);
-   const dlg = (project.tracks.dialogue || []).filter((x) => x.start < end && roundT(x.start + x.duration) > v.start);
+   const adj = allAdjust.filter((x) => x.start < end && roundT(x.start + x.duration) > v.start);
+   const dlg = dedupeByKey(allDlg.filter((x) => x.start < end && roundT(x.start + x.duration) > v.start), (d) => `${roundT(d.start)}|${d.speakerName}|${d.text}`)
+    .filter((d) => { if (seenDlg.has(d.id)) return false; seenDlg.add(d.id); return true; });
    const voiceBit = dlg.map((d) => `${d.speakerName}:"${d.text}"`).join(' ');
-   return `(${idx + 1}: ${fmtTimecode(v.start)}-${fmtTimecode(end)}) ${formatVideoDescriptor(v, adj, project, l)}${voiceBit ? ` | ${voiceBit}` : ''}`;
+   return `(${idx + 1}: ${fmtTimecode(v.start)}-${fmtTimecode(end)}) ${formatVideoDescriptor(v, adj, project, l, idx)}${voiceBit ? ` | ${voiceBit}` : ''}`;
   });
   sections.push(seq.join('\n'));
   if (negs) sections.push((l === 'en' ? 'Negative: ' : '负向约束：') + negs);
@@ -1185,10 +1625,9 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
  }
 
  if (m === 'timeline') {
-  // Slice timeline along ALL clip boundaries across all 5 tracks to capture exact J-cut/L-cut slices!
   const pts = new Set([0]);
-  for (const k of ['adjust', 'video', 'dialogue', 'audio', 'bgm']) {
-   for (const c of project.tracks[k] || []) {
+  for (const tr of getAllTracks(project)) {
+   for (const c of project.tracks[tr.key] || []) {
     pts.add(roundT(c.start));
     pts.add(roundT(c.start + c.duration));
    }
@@ -1205,6 +1644,9 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
    const headLine = `[${fmtTimecode(a)} -> ${fmtTimecode(b)} | ${dur}s]${st.video ? ` V1:${st.video.title}` : ' (Black / Gap)'}`;
    const bodyLines = [];
    if (st.video) bodyLines.push(`  Visual: ${formatVideoDescriptor(st.video, st.adjusts, project, l)}`);
+   for (const pv of st.pipVideos || []) {
+    bodyLines.push(`  ${pv._trackCode} Overlay: ${formatVideoDescriptor(pv, st.adjusts, project, l)}`);
+   }
    bodyLines.push(...formatAudioSummary(st.dialogues, st.audios, st.bgms, l));
    slices.push([headLine, ...bodyLines].join('\n'));
   }
@@ -1213,24 +1655,44 @@ export function compileTimelinePrompt(project, mode = null, lang = null) {
   return sections.join('\n\n');
  }
 
- // Default mode: 'storyboard' — ordered by V1 clips with synced overlapping T1/A1/A2/E1 annotations
+ // Default mode: 'storyboard' — ordered by V1 clips with deduplicated multi-track annotations
+ const seenCrossShot = new Set();
  const shotBlocks = videos.map((v, idx) => {
   const end = roundT(v.start + v.duration);
   const overlaps = (arr) => (arr || []).filter((x) => x.start < end && roundT(x.start + x.duration) > v.start);
-  const adj = overlaps(project.tracks.adjust);
-  const dlg = overlaps(project.tracks.dialogue);
-  const aud = overlaps(project.tracks.audio);
-  const bgm = overlaps(project.tracks.bgm);
+  const adj = overlaps(allAdjust);
+  const dlg = overlaps(allDlg);
+  const aud = overlaps(allAud);
+  const bgm = overlaps(allBgm);
+  const pips = overlaps(pipVideos).map((pv) => `  ${pv._trackCode || 'V2'} 画中画：${formatVideoDescriptor(pv, adj, project, l)}`);
   const lines = [
    `[${String(idx + 1).padStart(2, '0')} · ${fmtTimecode(v.start)} - ${fmtTimecode(end)} · ${v.duration}s] ${v.title || 'Shot'}`,
-   `  ${formatVideoDescriptor(v, adj, project, l)}`,
-   ...formatAudioSummary(dlg, aud, bgm, l)
+   `  ${formatVideoDescriptor(v, adj, project, l, idx)}`,
+   ...pips,
+   ...formatAudioSummary(dlg, aud, bgm, l, seenCrossShot)
   ];
   return lines.join('\n');
  });
 
  if (shotBlocks.length) {
   sections.push((l === 'en' ? '[V1 Storyboard & Track Sync]\n' : '【V1 分镜序列与多轨同步】\n') + shotBlocks.join('\n\n'));
+  const tailDlg = allDlg.filter((d) => !seenCrossShot.has(d.id));
+  const tailAud = allAud.filter((a) => !seenCrossShot.has(a.id));
+  const tailBgm = allBgm.filter((b) => !seenCrossShot.has(b.id));
+  const tailLines = formatAudioSummary(tailDlg, tailAud, tailBgm, l, seenCrossShot);
+  if (tailLines.length) {
+   sections.push((l === 'en' ? '[Extended / Gap Audio & Dialogue]\n' : '【独立 / 延伸音轨片段】\n') + tailLines.join('\n'));
+  }
+ } else {
+  // Audio/dialogue/adjust/pip-only timeline without V1 shots
+  const orphanLines = [];
+  for (const pv of pipVideos) {
+   orphanLines.push(`[${pv._trackCode || 'V2'} ${fmtTimecode(pv.start)}-${fmtTimecode(roundT(pv.start + pv.duration))}] ${formatVideoDescriptor(pv, allAdjust, project, l)}`);
+  }
+  orphanLines.push(...formatAudioSummary(allDlg, allAud, allBgm, l, seenCrossShot));
+  if (orphanLines.length) {
+   sections.push((l === 'en' ? '[Multi-Track Sequence]\n' : '【多轨独立片段（尚无 V1 主视频）】\n') + orphanLines.join('\n'));
+  }
  }
 
  if (negs) {
