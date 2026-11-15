@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { NLE_SQUARE_TEMPLATES, GROUPS } from '../dist/nle-catalog.mjs';
+import { renderOptionSwatch } from '../dist/nle-swatches.mjs';
+
 import {
  createBlankProject,
  createDemoProject,
@@ -209,4 +212,18 @@ test('timecode and aspectRatioParts formatting helpers handle custom inputs safe
  assert.equal(fmtFramesTimecode(4.5, 24), '00:04:12');
  assert.deepEqual(aspectRatioParts('custom', '2.35:1').w, 2.35);
  assert.deepEqual(aspectRatioParts('custom', 'bad').label, '16:9');
+});
+
+test('NLE_SQUARE_TEMPLATES and visual swatch square cards render cleanly', () => {
+ assert.ok(NLE_SQUARE_TEMPLATES.length >= 4);
+ for (const tpl of NLE_SQUARE_TEMPLATES) {
+  const proj = tpl.seed ? parseAnyProjectImport({ version: 2, ...tpl.seed }, { rekey: true }) : createDemoProject();
+  assert.ok(proj.tracks.video.length >= 2);
+  assert.ok(projectDuration(proj) > 0);
+ }
+ for (const gk of ['look', 'color', 'medium', 'texture', 'framing', 'move', 'angle', 'transition', 'lightSource', 'bgm']) {
+  const firstOpt = GROUPS[gk].options[0];
+  const html = renderOptionSwatch(gk, firstOpt);
+  assert.match(html, /swatch-visual/);
+ }
 });
