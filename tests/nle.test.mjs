@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { NLE_SQUARE_TEMPLATES, GROUPS } from '../dist/nle-catalog.mjs';
 import { renderOptionSwatch } from '../dist/nle-swatches.mjs';
+import { ICON_IDS, uiIcon } from '../dist/nle-icons.mjs';
 
 import {
  createBlankProject,
@@ -226,4 +230,27 @@ test('NLE_SQUARE_TEMPLATES and visual swatch square cards render cleanly', () =>
   const html = renderOptionSwatch(gk, firstOpt);
   assert.match(html, /swatch-visual/);
  }
+});
+
+test('Lucide linear SVG icon pack covers all UI references and replaces emoji glyphs', () => {
+ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+ const indexHtml = fs.readFileSync(path.join(rootDir, 'dist', 'index.html'), 'utf8');
+ const iconsSvg = fs.readFileSync(path.join(rootDir, 'dist', 'icons.svg'), 'utf8');
+ const appJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-app.mjs'), 'utf8');
+ const modelJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-model.mjs'), 'utf8');
+
+ for (const id of ICON_IDS) {
+  assert.ok(indexHtml.includes(`id="i-${id}"`), `Missing symbol i-${id} in index.html`);
+  assert.ok(iconsSvg.includes(`id="i-${id}"`), `Missing symbol i-${id} in icons.svg`);
+  assert.match(uiIcon(id), new RegExp(`<use href="#i-${id}"/>`));
+ }
+
+ for (const [, id] of appJs.matchAll(/uiIcon\(\s*'([a-z-]+)'/g)) {
+  assert.ok(ICON_IDS.has(id), `Unknown uiIcon('${id}') referenced in nle-app.mjs`);
+ }
+
+ const emojiRe = /[\u{1F300}-\u{1FAFF}\u2600-\u27BF\u23E9-\u23FF]/gu;
+ assert.deepEqual(appJs.match(emojiRe), null);
+ assert.deepEqual(modelJs.match(emojiRe), null);
+ assert.deepEqual(indexHtml.match(emojiRe), null);
 });

@@ -53,19 +53,28 @@ import {
 } from './nle-storage.mjs';
 
 import { renderOptionSwatch } from './nle-swatches.mjs';
+import { uiIcon } from './nle-icons.mjs';
 
 const MAX_HISTORY = 60;
 
 const RESOURCE_TABS = [
- { id: 'media', icon: '🎬', label: '素材' },
- { id: 'style', icon: '✨', label: '风格特效' },
- { id: 'camera', icon: '🎥', label: '运镜' },
- { id: 'transitions', icon: '⇄', label: '转场' },
- { id: 'audio', icon: '🔊', label: '音频' },
- { id: 'dialogue', icon: 'TT', label: '文本对白' },
- { id: 'adjust', icon: '🔆', label: '调节层' },
- { id: 'entities', icon: '🧑', label: '角色场景' }
+ { id: 'media', icon: 'media', label: '素材' },
+ { id: 'style', icon: 'style-effects', label: '风格特效' },
+ { id: 'camera', icon: 'camera-move', label: '运镜' },
+ { id: 'transitions', icon: 'transition', label: '转场' },
+ { id: 'audio', icon: 'audio', label: '音频' },
+ { id: 'dialogue', icon: 'dialogue-text', label: '文本对白' },
+ { id: 'adjust', icon: 'adjustment', label: '调节层' },
+ { id: 'entities', icon: 'characters-scene', label: '角色场景' }
 ];
+
+const TRACK_ICON_MAP = {
+ adjust: 'adjust-track',
+ video: 'storyboard-track',
+ dialogue: 'subtitle-track',
+ audio: 'sfx-track',
+ bgm: 'music-track'
+};
 
 const appState = {
  screen: 'home',         // 'home' | 'editor'
@@ -183,7 +192,7 @@ function stopPlayback() {
   appState.rafId = 0;
  }
  const btn = document.getElementById('playPauseBtn');
- if (btn) btn.textContent = '▶ 播放';
+ if (btn) btn.innerHTML = `${uiIcon('play')}<span>播放</span>`;
 }
 
 function togglePlayback() {
@@ -202,7 +211,7 @@ function togglePlayback() {
  appState.playing = true;
  appState.lastRafTs = performance.now();
  const btn = document.getElementById('playPauseBtn');
- if (btn) btn.textContent = '⏸ 暂停';
+ if (btn) btn.innerHTML = `${uiIcon('pause')}<span>暂停</span>`;
 
  const tick = (now) => {
   if (!appState.playing) return;
@@ -298,8 +307,8 @@ function renderDraftCard(item) {
      <div class="draft-sub">${esc(formatDateShort(item.updatedAt))} · ${dur}s</div>
     </div>
     <div class="draft-card-btns">
-     <button class="btn btn-sm" data-export-draft="${esc(item.id)}" title="导出 JSON">⬇</button>
-     <button class="btn btn-sm btn-danger" data-del-draft="${esc(item.id)}" title="删除草稿">🗑</button>
+     <button class="btn btn-sm" data-export-draft="${esc(item.id)}" title="导出 JSON">${uiIcon('export')}</button>
+     <button class="btn btn-sm btn-danger" data-del-draft="${esc(item.id)}" title="删除草稿">${uiIcon('delete')}</button>
     </div>
    </div>
   </div>`;
@@ -314,7 +323,7 @@ function renderHomeScreen() {
   mainHtml = `
    <div class="home-hero-create" data-action="new-blank-enter" role="button" tabindex="0">
     <div class="hero-create-btn">
-     <span class="hero-plus-circle">+</span>
+     <span class="hero-plus-circle">${uiIcon('plus', 'hero-plus-svg')}</span>
      <span>开始创作</span>
     </div>
    </div>
@@ -323,9 +332,12 @@ function renderHomeScreen() {
     <div class="drafts-toolbar">
      <div class="drafts-title">本地草稿 <span style="color:var(--text-dim);font-weight:500;font-size:12px;">(${visibleDrafts.length})</span></div>
      <div class="drafts-actions">
-      <input id="draftSearchInput" class="input" style="width:170px;" placeholder="搜索本地草稿…" value="${esc(appState.draftFilter)}" />
-      <button class="btn btn-sm" data-action="open-import">导入 1.0 / 2.0 工程</button>
-      <button class="btn btn-sm" data-action="load-demo-enter">+ 体验雨夜 5 轨示范</button>
+      <div class="search-field-wrap" style="width:182px;">
+       ${uiIcon('search', 'search-svg')}
+       <input id="draftSearchInput" class="input" placeholder="搜索本地草稿…" value="${esc(appState.draftFilter)}" />
+      </div>
+      <button class="btn btn-sm" data-action="open-import">${uiIcon('import')}<span>导入 1.0 / 2.0 工程</span></button>
+      <button class="btn btn-sm" data-action="load-demo-enter">${uiIcon('sample-draft')}<span>体验雨夜 5 轨示范</span></button>
      </div>
     </div>
 
@@ -337,8 +349,8 @@ function renderHomeScreen() {
       <div style="font-size:14px;font-weight:600;color:var(--text-main);margin-bottom:6px;">本地草稿箱暂无工程</div>
       <div style="font-size:12px;margin-bottom:14px;">点击上方「+ 开始创作」直接进入 00:00 空白多轨剪辑台，或从广场选用多轨模板 / 导入 1.0 工程。</div>
       <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
-       <button class="btn btn-jy" data-action="new-blank-enter">+ 立即从 00:00 开始创作</button>
-       <button class="btn" data-action="load-demo-enter">加载 5 轨示例预览</button>
+       <button class="btn btn-jy" data-action="new-blank-enter">${uiIcon('plus')}<span>立即从 00:00 开始创作</span></button>
+       <button class="btn" data-action="load-demo-enter">${uiIcon('sample-draft')}<span>加载 5 轨示例预览</span></button>
       </div>
      </div>`}
    </section>`;
@@ -346,7 +358,7 @@ function renderHomeScreen() {
   mainHtml = `
    <div style="display:flex;justify-content:space-between;align-items:center;">
     <div>
-     <div style="font-size:16px;font-weight:800;">剪辑广场 · 多轨模板库</div>
+     <div style="display:inline-flex;align-items:center;gap:7px;font-size:16px;font-weight:800;">${uiIcon('template', 'title-svg')}<span>剪辑广场 · 多轨模板库</span></div>
      <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">点击任意模板即刻复制到本地草稿并进入五轨工作台（100% 本地开箱即用，无需 AI）</div>
     </div>
    </div>
@@ -363,26 +375,26 @@ function renderHomeScreen() {
       <div class="tpl-body">
        <div style="font-size:11px;color:var(--jy-teal);font-weight:700;">${esc(t.badge)}</div>
        <div style="font-size:12px;color:var(--text-muted);flex:1 1 auto;">${esc(t.desc)}</div>
-       <button class="btn btn-jy" data-use-template="${esc(t.id)}">使用模板开始剪辑</button>
+       <button class="btn btn-jy" data-use-template="${esc(t.id)}">${uiIcon('plus')}<span>使用模板开始剪辑</span></button>
       </div>
      </div>`).join('')}
    </div>`;
  } else {
   mainHtml = `
    <div>
-    <div style="font-size:16px;font-weight:800;">我的云空间（本地免登录 IndexedDB 档案库）</div>
+    <div style="display:inline-flex;align-items:center;gap:7px;font-size:16px;font-weight:800;">${uiIcon('layers', 'title-svg')}<span>我的云空间（本地免登录 IndexedDB 档案库）</span></div>
     <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">当前版本专注于纯本地隐私安全：不设账号登录系统，所有草稿安全保存在浏览器 IndexedDB 与可导出的 JSON 文件中。</div>
    </div>
    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;">
     <div class="entity-item" style="padding:16px;">
-     <div style="font-size:13px;font-weight:700;margin-bottom:6px;">📦 本地持久化草稿 (${appState.drafts.length} 个)</div>
+     <div style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700;margin-bottom:6px;">${uiIcon('save', 'card-title-svg')}<span>本地持久化草稿 (${appState.drafts.length} 个)</span></div>
      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">每次添加镜头、调节滑块与编辑文字均会在 160ms 内自动保存，刷新浏览器不丢失。</div>
-     <button class="btn btn-sm btn-danger" data-action="clear-all-projects">清空本地历史草稿</button>
+     <button class="btn btn-sm btn-danger" data-action="clear-all-projects">${uiIcon('delete')}<span>清空本地历史草稿</span></button>
     </div>
     <div class="entity-item" style="padding:16px;">
-     <div style="font-size:13px;font-weight:700;margin-bottom:6px;">🔁 导入 1.0 / 2.0 工程档案</div>
+     <div style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700;margin-bottom:6px;">${uiIcon('import', 'card-title-svg')}<span>导入 1.0 / 2.0 工程档案</span></div>
      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">支持拖入或粘贴镜序 1.0 (.jingxu.json) 与镜序 2.0 (.jingxu2.json)，自动转为五轨草稿。</div>
-     <button class="btn btn-sm btn-jy" data-action="open-import">导入工程文件</button>
+     <button class="btn btn-sm btn-jy" data-action="open-import">${uiIcon('import')}<span>导入工程文件</span></button>
     </div>
    </div>
    ${appState.drafts.length ? `
@@ -395,17 +407,17 @@ function renderHomeScreen() {
    <aside class="home-sidebar">
     <div>
      <div class="home-brand">
-      <div class="home-brand-icon">✂</div>
+      <div class="home-brand-icon">${uiIcon('storyboard-track', 'brand-svg')}</div>
       <div>镜序 <span style="color:var(--jy-teal);">2.0</span></div>
      </div>
      <nav class="home-nav">
-      <button class="home-nav-btn ${appState.homeTab === 'home' ? 'active' : ''}" data-home-tab="home">🏠 <span>首页</span></button>
-      <button class="home-nav-btn ${appState.homeTab === 'square' ? 'active' : ''}" data-home-tab="square">🧭 <span>广场</span></button>
-      <button class="home-nav-btn ${appState.homeTab === 'cloud' ? 'active' : ''}" data-home-tab="cloud">☁️ <span>我的云空间</span></button>
+      <button class="home-nav-btn ${appState.homeTab === 'home' ? 'active' : ''}" data-home-tab="home">${uiIcon('home')}<span>首页</span></button>
+      <button class="home-nav-btn ${appState.homeTab === 'square' ? 'active' : ''}" data-home-tab="square">${uiIcon('gallery')}<span>广场</span></button>
+      <button class="home-nav-btn ${appState.homeTab === 'cloud' ? 'active' : ''}" data-home-tab="cloud">${uiIcon('layers')}<span>我的云空间</span></button>
      </nav>
     </div>
     <div class="home-sidebar-foot">
-     <div>● <b>0 AI 依赖 · 纯手动剪辑</b></div>
+     <div><span class="status-dot"></span><b>0 AI 依赖 · 纯手动剪辑</b></div>
      <div>免登录 · 数据本地自动存储</div>
     </div>
    </aside>
@@ -439,7 +451,7 @@ function renderSwatchGrid(groupKey, activeId, mode, subHint) {
      <button class="swatch-card ${isActive ? 'active' : ''}" data-apply-group="${esc(groupKey)}" data-apply-id="${esc(opt.id)}" data-apply-mode="${esc(mode)}" title="${esc(opt.zh || opt.label)}">
       <div class="swatch-box">
        ${renderOptionSwatch(groupKey, opt)}
-       <span class="swatch-apply-tag">${isActive ? '✓' : '+'}</span>
+       <span class="swatch-apply-tag">${uiIcon(isActive ? 'check' : 'plus')}</span>
       </div>
       <div class="swatch-title">${esc(opt.label)}</div>
      </button>`;
@@ -511,7 +523,7 @@ function renderResourceDock() {
   if (!cats.some((c) => c.id === appState.resSubCat)) appState.resSubCat = 'bgm';
   contentHtml = appState.resSubCat === 'sfx' ? `
    <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="btn btn-jy" data-action="quick-add-audio">+ 在播放头插入自定义音效 (A1)</button>
+    <button class="btn btn-jy" data-action="quick-add-audio">${uiIcon('plus')}<span>在播放头插入自定义音效 (A1)</span></button>
     ${CLIP_PRESETS.filter((x) => x.track === 'audio' || x.track === 'bgm').map((item) => `
      <div class="preset-card" data-preset-id="${esc(item.id)}">
       <div><div class="preset-label">${esc(item.label)}</div><div class="preset-sub">${item.duration}s</div></div>
@@ -523,7 +535,7 @@ function renderResourceDock() {
   appState.resSubCat = 't1';
   contentHtml = `
    <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="btn btn-jy" data-action="quick-add-dialogue">+ 在红线位置新建对白字幕 (T1)</button>
+    <button class="btn btn-jy" data-action="quick-add-dialogue">${uiIcon('plus')}<span>在红线位置新建对白字幕 (T1)</span></button>
     <div style="font-size:11.5px;color:var(--text-muted);line-height:1.6;">可将 T1 片段向左拖跨过上一个镜头尾部，轻松完成电影感 <b>J-Cut（未见其人先闻其声）</b>；或向右拖出完成 <b>L-Cut</b>。</div>
    </div>`;
  } else if (tab === 'adjust') {
@@ -531,7 +543,7 @@ function renderResourceDock() {
   if (!cats.some((c) => c.id === appState.resSubCat)) appState.resSubCat = 'e1';
   contentHtml = appState.resSubCat === 'e1' ? `
    <div style="display:flex;flex-direction:column;gap:8px;">
-    <button class="btn btn-jy" data-action="quick-add-adjust">+ 插入空白 E1 调节层</button>
+    <button class="btn btn-jy" data-action="quick-add-adjust">${uiIcon('plus')}<span>插入空白 E1 调节层</span></button>
     ${CLIP_PRESETS.filter((x) => x.track === 'adjust').map((item) => `
      <div class="preset-card" data-preset-id="${esc(item.id)}">
       <div><div class="preset-label">${esc(item.label)}</div><div class="preset-sub">跨镜覆写色调/光影/运镜 (${item.duration}s)</div></div>
@@ -544,12 +556,12 @@ function renderResourceDock() {
   contentHtml = appState.resSubCat === 'cast' ? `
    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <span style="font-size:11.5px;color:var(--text-muted);">固定人物跨镜锁定</span>
-    <button class="btn btn-sm btn-jy" data-action="add-char">+ 新增角色</button>
+    <button class="btn btn-sm btn-jy" data-action="add-char">${uiIcon('plus')}<span>新增角色</span></button>
    </div>
    ${p.characters.map((c) => `
     <div class="entity-item">
      <div class="entity-head">
-      <span>${esc(c.name)} ${c.lockIdentity ? '🔒' : ''}</span>
+      <span style="display:inline-flex;align-items:center;">${esc(c.name)}${c.lockIdentity ? uiIcon('lock', 'inline-lock-svg') : ''}</span>
       <div style="display:flex;gap:4px;">
        <button class="btn btn-sm" data-edit-char="${esc(c.id)}">编辑</button>
        <button class="btn btn-sm" data-bind-char="${esc(c.id)}">入镜</button>
@@ -560,7 +572,7 @@ function renderResourceDock() {
     </div>`).join('') || '<div style="color:var(--text-dim);">暂无角色</div>'}` : `
    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <span style="font-size:11.5px;color:var(--text-muted);">空间光影场景锚点</span>
-    <button class="btn btn-sm btn-jy" data-action="add-scene">+ 新增场景</button>
+    <button class="btn btn-sm btn-jy" data-action="add-scene">${uiIcon('plus')}<span>新增场景</span></button>
    </div>
    ${p.scenes.map((s) => `
     <div class="entity-item">
@@ -581,7 +593,7 @@ function renderResourceDock() {
    <div class="res-icon-bar">
     ${RESOURCE_TABS.map((t) => `
      <button class="res-icon-btn ${tab === t.id ? 'active' : ''}" data-res-tab="${esc(t.id)}">
-      <span class="res-glyph">${esc(t.icon)}</span>
+      <span class="res-glyph">${uiIcon(t.icon)}</span>
       <span>${esc(t.label)}</span>
      </button>`).join('')}
    </div>
@@ -591,7 +603,10 @@ function renderResourceDock() {
     </div>
     <div class="res-content">
      <div class="res-search-row">
-      <input id="resSearchInput" class="input" placeholder="🔍 搜索当前分类…" value="${esc(appState.resSearch)}" />
+      <div class="search-field-wrap">
+       ${uiIcon('search', 'search-svg')}
+       <input id="resSearchInput" class="input" placeholder="搜索当前分类…" value="${esc(appState.resSearch)}" />
+      </div>
      </div>
      <div class="res-scroll">${contentHtml}</div>
     </div>
@@ -614,9 +629,9 @@ function renderProgramMonitorInner() {
     <div style="font-weight:700;font-size:13.5px;margin-bottom:4px;">空白时间轴 · 从 00:00 纯手动剪辑</div>
     <div class="blank-sub">直接点击左侧任意「风格方块 / 运镜 / 分镜积木」，立即将首镜放到时间轴上。</div>
     <div class="blank-actions">
-     <button class="btn btn-sm btn-jy" data-action="quick-add-video">+ 新建空白分镜</button>
-     <button class="btn btn-sm" data-action="quick-add-dialogue">+ 添对白 T1</button>
-     <button class="btn btn-sm" data-action="open-import">导入工程</button>
+     <button class="btn btn-sm btn-jy" data-action="quick-add-video">${uiIcon('plus')}<span>新建空白分镜</span></button>
+     <button class="btn btn-sm" data-action="quick-add-dialogue">${uiIcon('dialogue-text')}<span>添对白 T1</span></button>
+     <button class="btn btn-sm" data-action="open-import">${uiIcon('import')}<span>导入工程</span></button>
     </div>
    </div>`;
  }
@@ -649,12 +664,12 @@ function renderProgramMonitorInner() {
    <div class="stage-top-row">
     <div class="stage-badges">
      <span class="stage-chip">V1 · ${esc(v.title || '分镜')}</span>
-     ${st.adjusts.map((a) => `<span class="stage-chip adj">✨ ${esc(a.label)}</span>`).join('')}
-     ${st.transitionActive ? `<span class="stage-chip trans">⇄ ${esc(groupLabel('transition', st.transitionActive.type))}</span>` : ''}
+     ${st.adjusts.map((a) => `<span class="stage-chip adj">${uiIcon('adjustment', 'chip-svg')}<span>${esc(a.label)}</span></span>`).join('')}
+     ${st.transitionActive ? `<span class="stage-chip trans">${uiIcon('transition', 'chip-svg')}<span>${esc(groupLabel('transition', st.transitionActive.type))}</span></span>` : ''}
     </div>
     <div class="stage-badges">
-     ${st.audios.map((a) => `<span class="stage-chip sfx">🔊 ${esc(a.cue.slice(0, 14))}</span>`).join('')}
-     ${st.bgms.map((b) => `<span class="stage-chip bgm">🎵 ${esc(groupLabel('bgm', b.style) || 'BGM')}${b.isDucking ? ' [避让]' : ''}</span>`).join('')}
+     ${st.audios.map((a) => `<span class="stage-chip sfx">${uiIcon('volume', 'chip-svg')}<span>${esc(a.cue.slice(0, 14))}</span></span>`).join('')}
+     ${st.bgms.map((b) => `<span class="stage-chip bgm">${uiIcon('music-track', 'chip-svg')}<span>${esc(groupLabel('bgm', b.style) || 'BGM')}${b.isDucking ? ' [避让]' : ''}</span></span>`).join('')}
     </div>
    </div>
    <div class="stage-mid-vf">
@@ -713,7 +728,7 @@ function renderRightInspector() {
   return `
    <aside class="insp-pane">
     <div class="insp-head">
-     <span>草稿参数</span>
+     <span>${uiIcon('file-settings', 'hdr-svg')}<span>草稿参数</span></span>
      <span style="font-size:11px;color:var(--text-dim);font-weight:500;">全局设置</span>
     </div>
     <div class="insp-scroll">
@@ -750,7 +765,7 @@ function renderRightInspector() {
      </div>
     </div>
     <div class="insp-foot">
-     <button class="btn btn-compile-hero" style="width:100%;" data-action="open-compile-modal">⚡ 2.0 提示词编译导出</button>
+     <button class="btn btn-compile-hero" style="width:100%;" data-action="open-compile-modal">${uiIcon('compile-prompt')}<span>2.0 提示词编译导出</span></button>
     </div>
    </aside>`;
  }
@@ -759,8 +774,8 @@ function renderRightInspector() {
  if (sel.track === 'video') {
   formHtml = `
    <div class="sub-pill-tabs">
-    <button class="pill-btn ${appState.inspSubTab === 'content' ? 'active' : ''}" data-insp-sub="content">画面与文案</button>
-    <button class="pill-btn ${appState.inspSubTab === 'link' ? 'active' : ''}" data-insp-sub="link">人物场景/参考</button>
+    <button class="pill-btn ${appState.inspSubTab === 'content' ? 'active' : ''}" data-insp-sub="content">${uiIcon('script-text', 'pill-svg')}<span>画面与文案</span></button>
+    <button class="pill-btn ${appState.inspSubTab === 'link' ? 'active' : ''}" data-insp-sub="link">${uiIcon('character-ref', 'pill-svg')}<span>人物场景/参考</span></button>
    </div>
    ${appState.inspSubTab === 'content' ? `
     <div class="field-grid">
@@ -842,12 +857,12 @@ function renderRightInspector() {
  return `
   <aside class="insp-pane">
    <div class="insp-head">
-    <span>片段参数 · ${esc(sel.track.toUpperCase())}</span>
+    <span>${uiIcon('clip-settings', 'hdr-svg')}<span>片段参数 · ${esc(sel.track.toUpperCase())}</span></span>
     <button class="btn btn-sm" data-action="deselect-clip" title="返回查看草稿全局参数">草稿参数</button>
    </div>
    <div class="insp-scroll">${formHtml}</div>
    <div class="insp-foot">
-    <button class="btn btn-compile-hero" style="width:100%;" data-action="open-compile-modal">⚡ 2.0 提示词编译导出</button>
+    <button class="btn btn-compile-hero" style="width:100%;" data-action="open-compile-modal">${uiIcon('compile-prompt')}<span>2.0 提示词编译导出</span></button>
    </div>
   </aside>`;
 }
@@ -909,13 +924,13 @@ function renderTimelineBody() {
     const curr = clips[i];
     if (Math.abs(curr.start - roundT(prev.start + prev.duration)) < 0.25) {
      const hasFx = curr.transitionIn && curr.transitionIn !== 'cut' && curr.transitionIn !== 'direct_cut';
-     clipsHtml += `<button class="trans-capsule${hasFx ? ' has-fx' : ''}" style="left:${Math.round(curr.start * p.zoom)}px;" data-jump-trans="${esc(curr.id)}" title="点击切到转场面板编辑">⇄</button>`;
+     clipsHtml += `<button class="trans-capsule${hasFx ? ' has-fx' : ''}" style="left:${Math.round(curr.start * p.zoom)}px;" data-jump-trans="${esc(curr.id)}" title="点击切到转场面板编辑">${uiIcon('transition')}</button>`;
     }
    }
   }
 
   if (!clips.length && total === 0 && tr.key === 'video') {
-   clipsHtml += `<div class="tl-empty-drop">🎬 00:00 空白起剪：点击左上方「风格特效 / 运镜方框」或工具栏「+ 分镜 V1」，开始你的创作吧~</div>`;
+   clipsHtml += `<div class="tl-empty-drop">${uiIcon('storyboard-track', 'drop-svg')}<span>00:00 空白起剪：点击左上方「风格特效 / 运镜方框」或工具栏「+ 分镜 V1」，开始你的创作吧~</span></div>`;
   }
 
   return `<div class="tl-lane ${tr.key === 'video' ? 'video-row' : ''}" data-lane-track="${esc(tr.key)}">${clipsHtml}</div>`;
@@ -927,10 +942,11 @@ function renderTimelineBody() {
    ${TRACKS.map((tr) => `
     <div class="tl-track-header ${tr.key === 'video' ? 'video-row' : ''}">
      <div class="tl-th-info">
+      ${uiIcon(TRACK_ICON_MAP[tr.key] || 'layers', 'track-ico')}
       <span class="track-badge ${esc(tr.key)}">${esc(tr.code)}</span>
       <span class="tl-th-name">${esc(tr.label)}</span>
      </div>
-     <button class="btn btn-sm" style="padding:1px 6px;" data-add-on-track="${esc(tr.key)}">+</button>
+     <button class="btn btn-sm" style="padding:2px 5px;" data-add-on-track="${esc(tr.key)}" title="添加${esc(tr.label)}">${uiIcon('plus')}</button>
     </div>`).join('')}
   </div>
   <div id="tlViewport" class="tl-viewport">
@@ -953,17 +969,17 @@ function renderEditorScreen() {
  return `
   <header class="jy-topbar">
    <div class="topbar-left">
-    <button class="btn btn-sm" data-action="go-home">← 首页</button>
-    <button class="btn btn-sm" data-action="open-import">导入 (1.0/2.0)</button>
-    <button class="btn btn-sm" data-action="load-demo">示例草稿</button>
-    <button class="btn btn-sm" data-action="new-blank-stay">新建空白</button>
+    <button class="btn btn-sm" data-action="go-home">${uiIcon('home')}<span>首页</span></button>
+    <button class="btn btn-sm" data-action="open-import">${uiIcon('import')}<span>导入 (1.0/2.0)</span></button>
+    <button class="btn btn-sm" data-action="load-demo">${uiIcon('sample-draft')}<span>示例草稿</span></button>
+    <button class="btn btn-sm" data-action="new-blank-stay">${uiIcon('new-blank')}<span>新建空白</span></button>
    </div>
    <div class="topbar-center">
     <input class="title-input-center" data-proj-field="title" value="${esc(p.title)}" title="点击编辑草稿名称" />
    </div>
    <div class="topbar-right">
-    <span class="no-ai-tag">0 AI 依赖</span>
-    <button class="btn btn-compile-hero" data-action="open-compile-modal">⚡ 2.0 提示词编译导出</button>
+    <span class="no-ai-tag">${uiIcon('check', 'tag-svg')}<span>0 AI 依赖</span></span>
+    <button class="btn btn-compile-hero" data-action="open-compile-modal">${uiIcon('compile-prompt')}<span>2.0 提示词编译导出</span></button>
    </div>
   </header>
 
@@ -971,7 +987,7 @@ function renderEditorScreen() {
    ${renderResourceDock()}
    <section class="monitor-pane">
     <div class="monitor-header">
-     <span>播放器 · ${esc(ratio.label)} · ${esc(p.resolution)}</span>
+     <span>${uiIcon('aspect-ratio', 'hdr-svg')}<span>播放器 · ${esc(ratio.label)} · ${esc(p.resolution)}</span></span>
      <span>V1:${p.tracks.video.length} T1:${p.tracks.dialogue.length} A1:${p.tracks.audio.length} A2:${p.tracks.bgm.length} E1:${p.tracks.adjust.length}</span>
     </div>
     <div class="monitor-bay">
@@ -981,9 +997,9 @@ function renderEditorScreen() {
     </div>
     <div class="monitor-transport">
      <div style="display:flex;gap:4px;align-items:center;">
-      <button class="btn btn-sm" data-action="seek-start">⏮</button>
-      <button id="playPauseBtn" class="btn btn-sm btn-jy" data-action="toggle-play" style="min-width:64px;">${appState.playing ? '⏸ 暂停' : '▶ 播放'}</button>
-      <button class="btn btn-sm" data-action="seek-end">⏭</button>
+      <button class="btn btn-sm" data-action="seek-start" title="回到片头">${uiIcon('skip-back')}</button>
+      <button id="playPauseBtn" class="btn btn-sm btn-jy" data-action="toggle-play" style="min-width:68px;">${appState.playing ? `${uiIcon('pause')}<span>暂停</span>` : `${uiIcon('play')}<span>播放</span>`}</button>
+      <button class="btn btn-sm" data-action="seek-end" title="跳到片尾">${uiIcon('skip-forward')}</button>
      </div>
      <input id="monitorScrubber" class="scrub-slider" type="range" min="0" max="${Math.max(1, total)}" step="0.1" value="${Math.min(p.playhead, Math.max(1, total))}" />
      <div id="monitorTimecode" class="timecode-readout">${esc(fmtFramesTimecode(p.playhead, p.fps))} <span class="timecode-total">/ ${esc(fmtFramesTimecode(total, p.fps))}</span></div>
@@ -995,23 +1011,23 @@ function renderEditorScreen() {
   <section class="timeline-dock">
    <div class="tl-toolbar">
     <div class="tl-tool-group">
-     <button class="btn btn-sm" data-add-on-track="video">+ 分镜 V1</button>
-     <button class="btn btn-sm" data-add-on-track="dialogue">+ 对白 T1</button>
-     <button class="btn btn-sm" data-add-on-track="audio">+ 音效 A1</button>
-     <button class="btn btn-sm" data-add-on-track="bgm">+ 配乐 A2</button>
-     <button class="btn btn-sm" data-add-on-track="adjust">+ 调节 E1</button>
+     <button class="btn btn-sm" data-add-on-track="video">${uiIcon('plus')}<span>分镜 V1</span></button>
+     <button class="btn btn-sm" data-add-on-track="dialogue">${uiIcon('plus')}<span>对白 T1</span></button>
+     <button class="btn btn-sm" data-add-on-track="audio">${uiIcon('plus')}<span>音效 A1</span></button>
+     <button class="btn btn-sm" data-add-on-track="bgm">${uiIcon('plus')}<span>配乐 A2</span></button>
+     <button class="btn btn-sm" data-add-on-track="adjust">${uiIcon('plus')}<span>调节 E1</span></button>
      <div class="tl-sep"></div>
-     <button class="btn btn-sm" data-action="undo"${appState.history.length ? '' : ' disabled'} title="撤销 (Ctrl+Z)">↶</button>
-     <button class="btn btn-sm" data-action="redo"${appState.future.length ? '' : ' disabled'} title="重做 (Ctrl+Y)">↷</button>
-     <button class="btn btn-sm" data-action="split-playhead" title="在播放头红线分割片段 (B/S)">✂️ 分割</button>
-     <button class="btn btn-sm" data-action="dup-selected"${clip ? '' : ' disabled'} title="复制选中">📋</button>
-     <button class="btn btn-sm btn-danger" data-action="del-selected"${clip ? '' : ' disabled'} title="删除选中 (Del)">🗑</button>
+     <button class="btn btn-sm" data-action="undo"${appState.history.length ? '' : ' disabled'} title="撤销 (Ctrl+Z)">${uiIcon('undo')}</button>
+     <button class="btn btn-sm" data-action="redo"${appState.future.length ? '' : ' disabled'} title="重做 (Ctrl+Y)">${uiIcon('redo')}</button>
+     <button class="btn btn-sm" data-action="split-playhead" title="在播放头红线分割片段 (B/S)">${uiIcon('split')}<span>分割</span></button>
+     <button class="btn btn-sm" data-action="dup-selected"${clip ? '' : ' disabled'} title="复制选中">${uiIcon('layers')}</button>
+     <button class="btn btn-sm btn-danger" data-action="del-selected"${clip ? '' : ' disabled'} title="删除选中 (Del)">${uiIcon('delete')}</button>
     </div>
     <div class="tl-tool-group">
-     <button class="btn btn-sm btn-jy" data-action="open-compile-modal">⚡ 2.0 编译提示词</button>
+     <button class="btn btn-sm btn-jy" data-action="open-compile-modal">${uiIcon('compile-prompt')}<span>2.0 编译提示词</span></button>
      <div class="tl-sep"></div>
-     <button class="btn btn-sm ${p.snap ? 'btn-active' : ''}" data-action="toggle-snap">🧲 磁吸</button>
-     <button class="btn btn-sm ${p.ripple ? 'btn-active' : ''}" data-action="toggle-ripple">🔗 联动</button>
+     <button class="btn btn-sm ${p.snap ? 'btn-active' : ''}" data-action="toggle-snap">${uiIcon('magnet')}<span>磁吸</span></button>
+     <button class="btn btn-sm ${p.ripple ? 'btn-active' : ''}" data-action="toggle-ripple">${uiIcon('link')}<span>联动</span></button>
      <input id="zoomSlider" type="range" min="36" max="150" step="4" value="${p.zoom}" style="width:80px;accent-color:var(--jy-teal);" title="缩放时间轴" />
     </div>
    </div>
@@ -1033,8 +1049,8 @@ function renderModal() {
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box wide">
      <div class="modal-head">
-      <span>⚡ 镜序 2.0 多轨提示词编译导出 (${esc(p.title)})</span>
-      <button class="btn btn-sm" data-close-modal="1">✕</button>
+      <span>${uiIcon('compile-prompt', 'modal-title-svg')}<span>镜序 2.0 多轨提示词编译导出 (${esc(p.title)})</span></span>
+      <button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button>
      </div>
      <div class="modal-body">
       <div class="compile-modal-grid">
@@ -1057,12 +1073,12 @@ function renderModal() {
          <div><b>轨道数量：</b>V1:${p.tracks.video.length} / T1:${p.tracks.dialogue.length} / A1:${p.tracks.audio.length} / A2:${p.tracks.bgm.length} / E1:${p.tracks.adjust.length}</div>
          <div><b>说明：</b>已自动融合调节层覆写与跨镜 J-Cut / 人声避让标识。</div>
         </div>
-        <button class="btn btn-jy" style="padding:8px 12px;" data-action="copy-prompt">📋 一键复制完整提示词</button>
+        <button class="btn btn-jy" style="padding:8px 12px;" data-action="copy-prompt">${uiIcon('layers')}<span>一键复制完整提示词</span></button>
         <div style="display:flex;gap:6px;">
-         <button class="btn btn-sm" style="flex:1;" data-action="download-txt">下载 .txt</button>
-         <button class="btn btn-sm" style="flex:1;" data-action="download-csv">导出 .csv</button>
+         <button class="btn btn-sm" style="flex:1;" data-action="download-txt">${uiIcon('export')}<span>下载 .txt</span></button>
+         <button class="btn btn-sm" style="flex:1;" data-action="download-csv">${uiIcon('export')}<span>导出 .csv</span></button>
         </div>
-        <button class="btn btn-sm" data-action="export-json">导出工程备份 .jingxu2.json</button>
+        <button class="btn btn-sm" data-action="export-json">${uiIcon('save')}<span>导出工程备份 .jingxu2.json</span></button>
        </div>
        <div>
         <textarea id="compileOutputBox" class="compile-box" readonly>${esc(compiled)}</textarea>
@@ -1078,8 +1094,8 @@ function renderModal() {
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box">
      <div class="modal-head">
-      <span>导入工程 (兼容 2.0 多轨 JSON & 1.0 .jingxu.json)</span>
-      <button class="btn btn-sm" data-close-modal="1">✕</button>
+      <span>${uiIcon('import', 'modal-title-svg')}<span>导入工程 (兼容 2.0 多轨 JSON & 1.0 .jingxu.json)</span></span>
+      <button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button>
      </div>
      <div class="modal-body">
       <label class="drop-zone" for="importFileInput">
@@ -1105,7 +1121,7 @@ function renderModal() {
   return `
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box">
-     <div class="modal-head"><span>编辑角色定妆卡</span><button class="btn btn-sm" data-close-modal="1">✕</button></div>
+     <div class="modal-head"><span>${uiIcon('character-ref', 'modal-title-svg')}<span>编辑角色定妆卡</span></span><button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button></div>
      <div class="modal-body">
       <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px;">
        <span style="font-size:11px;color:var(--text-muted);">五官预设：</span>
@@ -1130,7 +1146,7 @@ function renderModal() {
   return `
    <div class="modal-backdrop" data-close-modal="1">
     <div class="modal-box">
-     <div class="modal-head"><span>编辑场景空间锚点</span><button class="btn btn-sm" data-close-modal="1">✕</button></div>
+     <div class="modal-head"><span>${uiIcon('gallery', 'modal-title-svg')}<span>编辑场景空间锚点</span></span><button class="btn btn-sm" data-close-modal="1" title="关闭">${uiIcon('close')}</button></div>
      <div class="modal-body">
       <div class="field-grid">
        ${SCENE_FIELDS.map(([key, label]) => `<div class="field ${key === 'description' ? 'full' : ''}"><label>${esc(label)}</label><input class="input" data-scene-draft="${esc(key)}" value="${esc(s[key] || '')}" /></div>`).join('')}
@@ -1730,7 +1746,7 @@ rootEl.addEventListener('click', async (e) => {
   if (!res.ok) { appState.history.pop(); showToast(res.reason || '当前无法分割'); return; }
   scheduleSave();
   render();
-  showToast('✂️ 已在播放头位置分割');
+  showToast('已在播放头位置分割');
   return;
  }
 
@@ -1976,7 +1992,7 @@ document.addEventListener('keydown', (e) => {
   pushUndo();
   const res = splitAtPlayhead(appState.project);
   if (!res.ok) { appState.history.pop(); showToast(res.reason); }
-  else { scheduleSave(); render(); showToast('✂️ 已分割'); }
+  else { scheduleSave(); render(); showToast('已分割'); }
   return;
  }
  if (e.key === 'Delete' || e.key === 'Backspace') {

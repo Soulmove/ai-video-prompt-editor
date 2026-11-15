@@ -77,6 +77,64 @@ html, body {
  font-size: 14px;
 }
 
+/* Minimal Linear Vector Icons (Lucide Sprite) */
+.jy-icon {
+ width: 1em;
+ height: 1em;
+ display: inline-block;
+ flex: 0 0 auto;
+ vertical-align: -0.125em;
+ color: inherit;
+ pointer-events: none;
+}
+.btn .jy-icon { width: 14px; height: 14px; }
+.btn-sm .jy-icon { width: 13px; height: 13px; }
+.btn-compile-hero .jy-icon { width: 15px; height: 15px; }
+.home-nav-btn .jy-icon { width: 16px; height: 16px; color: var(--text-muted); transition: color 0.12s; }
+.home-nav-btn:hover .jy-icon { color: var(--text-main); }
+.home-nav-btn.active .jy-icon { color: var(--jy-teal); }
+.brand-svg { width: 15px; height: 15px; }
+.hero-plus-svg { width: 15px; height: 15px; }
+.hdr-svg { width: 14px; height: 14px; color: var(--jy-teal); }
+.pill-svg { width: 12px; height: 12px; }
+.track-ico { width: 13px; height: 13px; color: var(--text-muted); }
+.trans-capsule .jy-icon { width: 12px; height: 12px; }
+.swatch-apply-tag .jy-icon { width: 11px; height: 11px; }
+.chip-svg { width: 11px; height: 11px; flex: 0 0 auto; }
+.tag-svg { width: 11px; height: 11px; }
+.title-svg { width: 17px; height: 17px; color: var(--jy-teal); }
+.card-title-svg { width: 15px; height: 15px; color: var(--jy-teal); }
+.modal-title-svg { width: 16px; height: 16px; color: var(--jy-teal); }
+.drop-svg { width: 15px; height: 15px; color: var(--jy-teal); margin-right: 6px; }
+.inline-lock-svg { width: 12px; height: 12px; color: var(--jy-teal); margin-left: 3px; }
+
+.search-field-wrap {
+ position: relative;
+ display: flex;
+ align-items: center;
+}
+.search-field-wrap .search-svg {
+ position: absolute;
+ left: 8px;
+ width: 13px;
+ height: 13px;
+ color: var(--text-dim);
+ pointer-events: none;
+}
+.search-field-wrap .input {
+ padding-left: 26px;
+}
+.status-dot {
+ display: inline-block;
+ width: 6px;
+ height: 6px;
+ border-radius: 99px;
+ background: #34d399;
+ box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
+ margin-right: 5px;
+ vertical-align: 1px;
+}
+
 /* Shared Buttons & Inputs (Jianying Dark Style) */
 .btn {
  display: inline-flex;
@@ -491,6 +549,9 @@ html, body {
 }
 
 .no-ai-tag {
+ display: inline-flex;
+ align-items: center;
+ gap: 4px;
  font-size: 11px;
  font-weight: 600;
  color: #34d399;
@@ -559,8 +620,14 @@ html, body {
  background: rgba(0, 196, 204, 0.1);
 }
 .res-glyph {
- font-size: 14px;
- line-height: 1.1;
+ display: inline-flex;
+ align-items: center;
+ justify-content: center;
+ height: 18px;
+}
+.res-glyph .jy-icon {
+ width: 17px;
+ height: 17px;
 }
 
 .res-body {
@@ -844,6 +911,9 @@ html, body {
  gap: 4px;
 }
 .stage-chip {
+ display: inline-flex;
+ align-items: center;
+ gap: 3px;
  font-size: 10.5px;
  padding: 2px 6px;
  border-radius: 4px;
@@ -965,6 +1035,13 @@ html, body {
  font-size: 12px;
  font-weight: 700;
 }
+.monitor-header > span:first-child,
+.insp-head > span:first-child,
+.modal-head > span:first-child {
+ display: inline-flex;
+ align-items: center;
+ gap: 6px;
+}
 .insp-scroll {
  flex: 1 1 auto;
  overflow-y: auto;
@@ -1022,6 +1099,9 @@ html, body {
  margin-bottom: 10px;
 }
 .pill-btn {
+ display: inline-flex;
+ align-items: center;
+ gap: 4px;
  border: 1px solid var(--border);
  background: var(--bg-elevated);
  color: var(--text-muted);
@@ -1162,8 +1242,8 @@ html, body {
 }
 
 .tl-headers {
- width: 132px;
- flex: 0 0 132px;
+ width: 148px;
+ flex: 0 0 148px;
  background: #141416;
  border-right: 1px solid var(--border);
  display: flex;

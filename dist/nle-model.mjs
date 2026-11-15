@@ -709,7 +709,7 @@ export function validateTimeline(project) {
     severity: 'info',
     track: 'video',
     clipId: v.id,
-    message: `V1「${v.title}」时长 ${v.duration}s 较长，可用「✂️ 分割」拆成多个景别节奏更稳。`
+    message: `V1「${v.title}」时长 ${v.duration}s 较长，可用「分割」拆成多个景别节奏更稳。`
    });
   }
   if (i > 0) {
