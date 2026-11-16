@@ -16,7 +16,8 @@ export const ICON_IDS = new Set([
  'sticker', 'smart-package', 'filter', 'template', 'digital-human', 'plugin',
  'save', 'export', 'settings', 'close', 'check', 'chevron-down',
  'aspect-ratio', 'layers', 'text', 'voiceover', 'image', 'gallery',
- 'move', 'select', 'timer'
+ 'move', 'select', 'timer',
+ 'ai-spark', 'key'
 ]);
 
 export function uiIcon(name, extraClass = '') {

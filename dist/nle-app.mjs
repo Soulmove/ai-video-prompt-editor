@@ -78,11 +78,35 @@ import {
 
 import { renderOptionSwatch } from './nle-swatches.mjs';
 import { uiIcon } from './nle-icons.mjs';
+import {
+ AI_STORY_TEMPLATES,
+ AI_VISUAL_PRESETS,
+ AI_TEXTURE_PRESETS,
+ AI_CAMERA_PREFS,
+ AI_TRANSITION_PREFS,
+ AI_DIALOGUE_MODES,
+ AI_CAST_NATIONALITIES,
+ AI_CAST_FACE_TIERS,
+ AI_CAST_SKIN_RENDERS,
+ AI_BGM_MODES,
+ DEFAULT_AI_SCOPES,
+ normalizeAIBrief,
+ briefPreselectionSummary
+} from './nle-ai-brief.mjs';
+import {
+ DEFAULT_AI_MODEL,
+ DEFAULT_THINKING_LEVEL,
+ THINKING_LEVELS,
+ testGoogleConnection,
+ generateNleAIPlan,
+ applyNleAIPlan
+} from './nle-ai.mjs';
 
 const MAX_HISTORY = 60;
 
 const RESOURCE_TABS = [
  { id: 'media', icon: 'media', label: '素材' },
+ { id: 'ai', icon: 'ai-spark', label: 'AI辅助' },
  { id: 'style', icon: 'style-effects', label: '风格特效' },
  { id: 'camera', icon: 'camera-move', label: '运镜' },
  { id: 'transitions', icon: 'transition', label: '转场' },
@@ -102,7 +126,7 @@ const TRACK_ICON_MAP = {
 
 const appState = {
  screen: 'home',         // 'home' | 'editor'
- homeTab: 'home',        // 'home' | 'square' | 'cloud'
+ homeTab: 'home',        // 'home' | 'ai' | 'square' | 'cloud'
  drafts: [],             // Cached active IndexedDB drafts
  trashedDrafts: [],      // Soft-deleted recoverable drafts
  showTrash: false,
@@ -120,12 +144,40 @@ const appState = {
  inspSubTab: 'content',  // 'content' | 'link'
  trackMenuOpen: false,
 
+ aiConn: {
+  apiKey: '',
+  showKey: false,
+  model: DEFAULT_AI_MODEL,
+  thinkingLevel: DEFAULT_THINKING_LEVEL,
+  transport: 'browser',
+  verified: false,
+  testing: false,
+  statusMsg: '',
+  statusError: false,
+  serverHasKey: false,
+  staticHost: false
+ },
+ aiBrief: normalizeAIBrief({}),
+ aiScopes: { ...DEFAULT_AI_SCOPES },
+ aiApplyMode: 'fill',    // 'fill' | 'new'
+ aiAutoApply: true,
+ aiFlow: {
+  busy: false,
+  error: '',
+  startedAt: 0,
+  thoughtChars: 0,
+  answerChars: 0,
+  controller: null,
+  timer: 0,
+  result: null
+ },
+
  playing: false,
  rafId: 0,
  lastRafTs: 0,
  lastStageKey: '',
  lastStageDrawTs: 0,
- modal: null,            // null | { type: 'compile'|'import'|'char'|'scene'|'confirm'|'rename'|'help', ... }
+ modal: null,            // null | { type: 'compile'|'import'|'char'|'scene'|'confirm'|'rename'|'help'|'ai-guide', ... }
  toastMsg: '',
  toastTimer: 0,
  dragState: null
@@ -182,6 +234,18 @@ function pushUndo(snapshot = null, label = '编辑操作') {
  appState.future = [];
 }
 
+function persistAppPrefs() {
+ savePrefs({
+  zoom: appState.project.zoom,
+  outputMode: appState.project.outputMode,
+  outputLang: appState.project.outputLang,
+  aiModel: appState.aiConn.model,
+  aiThinkingLevel: appState.aiConn.thinkingLevel,
+  aiTransport: appState.aiConn.transport,
+  aiBrief: appState.aiBrief
+ });
+}
+
 function scheduleSave() {
  clearTimeout(saveTimer);
  saveTimer = setTimeout(async () => {
@@ -189,11 +253,7 @@ function scheduleSave() {
    appState.project.updatedAt = Date.now();
    await saveProject(appState.project);
    lastProject(appState.project.id);
-   savePrefs({
-    zoom: appState.project.zoom,
-    outputMode: appState.project.outputMode,
-    outputLang: appState.project.outputLang
-   });
+   persistAppPrefs();
    await refreshDraftsCache();
   } catch (err) {
    console.warn('Auto-save skipped:', err);
@@ -396,6 +456,543 @@ function renderTrashSection() {
   </section>`;
 }
 
+/* =========================================================
+   BUILT-IN AI DIRECTOR STUDIO (HOME & EDITOR SHARED)
+========================================================= */
+function isAIApiConfigured() {
+ return Boolean(appState.aiConn.apiKey?.trim()) || (appState.aiConn.transport === 'server' && appState.aiConn.serverHasKey);
+}
+
+function aiConnBadgeText() {
+ const c = appState.aiConn;
+ const modelTag = c.model === DEFAULT_AI_MODEL ? 'Hydrogen' : c.model;
+ const levelTag = String(c.thinkingLevel || DEFAULT_THINKING_LEVEL).toUpperCase();
+ if (c.testing) return `正在验证 ${modelTag}…`;
+ if (c.verified) return `已验证 · ${modelTag} (${levelTag})`;
+ if (c.apiKey?.trim()) return `已填 Key · ${modelTag} (${levelTag})`;
+ if (c.transport === 'server' && c.serverHasKey) return `服务端已配 Key · ${modelTag}`;
+ return `待填 API · ${modelTag} (${levelTag})`;
+}
+
+async function probeServerConfigIfLocal(force = false) {
+ const isLocal = typeof location !== 'undefined' && (location.hostname === '127.0.0.1' || location.hostname === 'localhost');
+ if (!isLocal && !force) return;
+ try {
+  const res = await fetch('./api/config', { cache: 'no-store', signal: AbortSignal.timeout(4000) });
+  const ct = res.headers.get('content-type') || '';
+  if (!res.ok || !ct.includes('application/json')) {
+   appState.aiConn.staticHost = true;
+   appState.aiConn.serverHasKey = false;
+   return;
+  }
+  const data = await res.json();
+  appState.aiConn.staticHost = false;
+  appState.aiConn.serverHasKey = Boolean(data?.ai?.ready);
+ } catch {
+  appState.aiConn.staticHost = true;
+  appState.aiConn.serverHasKey = false;
+ }
+}
+
+function aiWaitText() {
+ const f = appState.aiFlow;
+ const sec = f.startedAt ? Math.max(0, Math.floor((Date.now() - f.startedAt) / 1000)) : 0;
+ const m = String(Math.floor(sec / 60)).padStart(2, '0');
+ const s = String(sec % 60).padStart(2, '0');
+ const modelName = appState.aiConn.model || DEFAULT_AI_MODEL;
+ const lvl = String(appState.aiConn.thinkingLevel || DEFAULT_THINKING_LEVEL).toUpperCase();
+ const streamTxt = f.thoughtChars || f.answerChars
+  ? ` · 已收到思考 ${f.thoughtChars} 字 / 方案 ${f.answerChars} 字`
+  : '';
+ return `正在通过 ${modelName}（Thinking: ${lvl}）深度推演五轨时间轴… 已等待 ${m}:${s}${streamTxt}`;
+}
+
+function syncAIProgressDom() {
+ const el = document.getElementById('aiWaitStatus');
+ if (el && appState.aiFlow.busy) {
+  el.textContent = aiWaitText();
+ }
+}
+
+function renderAIApiPanel(compact = false) {
+ const c = appState.aiConn;
+ const ready = isAIApiConfigured();
+ return `
+  <section class="ai-card ${compact ? 'compact' : ''}">
+   <div class="ai-card-head">
+    <div class="ai-card-title">${uiIcon('key')}<span>Google Gemini API 接入配置</span></div>
+    <span class="ai-pill ${c.verified ? 'ok' : ready ? 'warm' : 'idle'}">${esc(aiConnBadgeText())}</span>
+   </div>
+   <div class="ai-help-note">默认调用 Google 官方 <code>${esc(DEFAULT_AI_MODEL)}</code> 模型并将推理档位设为 <code>high</code>；密钥仅暂存于当前页面内存，绝不写入草稿或 JSON 导出文件。</div>
+   <div class="field-grid ${compact ? 'ai-grid-1' : ''}">
+    <div class="field">
+     <label for="aiModelInput">Google 模型 ID</label>
+     <input id="aiModelInput" class="input" data-ai-conn="model" value="${esc(c.model)}" placeholder="${esc(DEFAULT_AI_MODEL)}" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="field">
+     <label for="aiThinkingSelect">思考深度 (Thinking Level)</label>
+     <select id="aiThinkingSelect" class="select" data-ai-conn="thinkingLevel">
+      ${THINKING_LEVELS.map(([id, label]) => `<option value="${esc(id)}"${id === c.thinkingLevel ? ' selected' : ''}>${esc(label)}</option>`).join('')}
+     </select>
+    </div>
+    <div class="field ${compact ? '' : 'full'}">
+     <label for="aiTransportSelect">连接方式</label>
+     <select id="aiTransportSelect" class="select" data-ai-conn="transport">
+      <option value="browser"${c.transport !== 'server' ? ' selected' : ''}>浏览器直连（推荐 · GitHub Pages 纯静态与本地均可用）</option>
+      <option value="server"${c.transport === 'server' ? ' selected' : ''}>本地服务器 / Worker 转发 (/api/ai/*)</option>
+     </select>
+    </div>
+    <div class="field full">
+     <label for="aiApiKeyInput">Google API Key（如 AI Studio 密钥）</label>
+     <div class="ai-key-row">
+      <input id="aiApiKeyInput" class="input" type="${c.showKey ? 'text' : 'password'}" data-ai-conn="apiKey" value="${esc(c.apiKey)}" placeholder="粘贴你的 Google AI Studio API Key…" autocomplete="off" spellcheck="false" />
+      <button type="button" class="btn btn-sm" data-action="ai-toggle-key-vis" title="${c.showKey ? '隐藏密钥' : '显示密钥'}">${uiIcon(c.showKey ? 'eye-off' : 'eye')}</button>
+     </div>
+    </div>
+   </div>
+   <div class="ai-btn-row">
+    <button type="button" class="btn btn-sm btn-jy" data-action="ai-test-conn"${c.testing ? ' disabled' : ''}>${uiIcon('check')}<span>${c.testing ? '正在验证权限…' : '测试并验证连接'}</span></button>
+    ${c.apiKey ? `<button type="button" class="btn btn-sm btn-danger" data-action="ai-disconnect">断开并清除 Key</button>` : ''}
+    <button type="button" class="btn btn-sm" data-action="ai-open-guide">接入说明</button>
+   </div>
+   ${c.statusMsg ? `<div id="aiConnFeedback" class="modal-alert ${c.statusError ? 'error' : 'info'}" style="margin-top:8px;margin-bottom:0;">${esc(c.statusMsg)}</div>` : ''}
+  </section>`;
+}
+
+function renderAIPreselectPanel(compact = false) {
+ const b = appState.aiBrief;
+ const cols = compact ? 'ai-grid-1' : '';
+ return `
+  <section class="ai-card ${compact ? 'compact' : ''}">
+   <div class="ai-card-head">
+    <div class="ai-card-title">${uiIcon('adjustment')}<span>提前预选条件（AI 将严格按以下选择生成）</span></div>
+    <span class="ai-pill idle">${briefPreselectionSummary(b).length} 项预设生效</span>
+   </div>
+
+   <div class="ai-sub-block">
+    <div class="ai-sub-label">01 · 快捷题材预选（点击一键套用题材与参考风格）</div>
+    <div class="ai-tpl-grid">
+     ${AI_STORY_TEMPLATES.map((t) => `
+      <button type="button" class="ai-tpl-chip" data-ai-tpl="${esc(t.id)}" title="${esc(t.idea)}">
+       <strong>${esc(t.label)}</strong>
+       <span>${esc(t.badge)}</span>
+      </button>`).join('')}
+    </div>
+   </div>
+
+   <div class="ai-sub-block">
+    <div class="ai-sub-label">02 · 画面规格与美学质感</div>
+    <div class="field-grid ${cols}">
+     <div class="field">
+      <label>画幅比例</label>
+      <select class="select" data-ai-brief="format">
+       <option value="match_project"${b.format === 'match_project' ? ' selected' : ''}>沿用当前工程画幅 (${esc(displayAspectLabel(appState.project))})</option>
+       ${NLE_FORMATS.filter(([id]) => id !== 'custom').map(([id, lb]) => `<option value="${esc(id)}"${id === b.format ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>目标分辨率</label>
+      <select class="select" data-ai-brief="resolution">
+       <option value="match_project"${b.resolution === 'match_project' ? ' selected' : ''}>沿用当前分辨率 (${esc(displayResolutionLabel(appState.project))})</option>
+       ${NLE_RESOLUTIONS.filter(([id]) => id !== 'custom').map(([id, lb]) => `<option value="${esc(id)}"${id === b.resolution ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>视觉美学 Preset</label>
+      <select class="select" data-ai-brief="visualPreset">
+       ${AI_VISUAL_PRESETS.map(([id, lb]) => `<option value="${esc(id)}"${id === b.visualPreset ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>拍摄媒介与胶片质感</label>
+      <select class="select" data-ai-brief="texturePreset">
+       ${AI_TEXTURE_PRESETS.map(([id, lb]) => `<option value="${esc(id)}"${id === b.texturePreset ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field full">
+      <label>全局色彩影调覆盖</label>
+      <select class="select" data-ai-brief="color">
+       <option value="">跟随视觉预设 / AI 自动搭配</option>
+       ${groupOptions('color').map((o) => `<option value="${esc(o.id)}"${o.id === b.color ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}
+      </select>
+     </div>
+    </div>
+   </div>
+
+   <div class="ai-sub-block">
+    <div class="ai-sub-label">03 · 运镜、转场、镜数与轨道开关</div>
+    <div class="field-grid ${cols}">
+     <div class="field">
+      <label>摄影运镜偏好</label>
+      <select class="select" data-ai-brief="cameraPref">
+       ${AI_CAMERA_PREFS.map(([id, lb]) => `<option value="${esc(id)}"${id === b.cameraPref ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>剪辑转场风格</label>
+      <select class="select" data-ai-brief="transitionStyle">
+       ${AI_TRANSITION_PREFS.map(([id, lb]) => `<option value="${esc(id)}"${id === b.transitionStyle ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+    </div>
+    <div class="ai-check-pills">
+     <label class="ai-check-pill ${b.customShotTiming ? 'on' : ''}"><input type="checkbox" data-ai-brief-bool="customShotTiming"${b.customShotTiming ? ' checked' : ''} /><span>自定分镜数与时长</span></label>
+     <label class="ai-check-pill ${b.chainLastFrame ? 'on' : ''}"><input type="checkbox" data-ai-brief-bool="chainLastFrame"${b.chainLastFrame ? ' checked' : ''} /><span>尾帧承接下一镜首帧</span></label>
+     <label class="ai-check-pill ${b.includeAdjustLayer ? 'on' : ''}"><input type="checkbox" data-ai-brief-bool="includeAdjustLayer"${b.includeAdjustLayer ? ' checked' : ''} /><span>生成 E1 调节层</span></label>
+     <label class="ai-check-pill ${b.generateSfx ? 'on' : ''}"><input type="checkbox" data-ai-brief-bool="generateSfx"${b.generateSfx ? ' checked' : ''} /><span>生成 A1 独立音效</span></label>
+     <label class="ai-check-pill ${b.reuseCurrentAssets ? 'on' : ''}"><input type="checkbox" data-ai-brief-bool="reuseCurrentAssets"${b.reuseCurrentAssets ? ' checked' : ''} /><span>优先复用当前角色与场景</span></label>
+    </div>
+    ${b.customShotTiming ? `
+     <div class="field-grid ${cols}" style="margin-top:8px;padding:8px;background:#111114;border:1px solid var(--border);border-radius:6px;">
+      <div class="field">
+       <label>分镜约束</label>
+       <select class="select" data-ai-brief="shotCountMode">
+        <option value="exact"${b.shotCountMode === 'exact' ? ' selected' : ''}>精确生成 N 镜</option>
+        <option value="max"${b.shotCountMode === 'max' ? ' selected' : ''}>控制在 N 镜内</option>
+       </select>
+      </div>
+      <div class="field">
+       <label>分镜数量</label>
+       <input type="number" min="1" max="80" step="1" class="input" data-ai-brief-num="shotCount" value="${b.shotCount}" />
+      </div>
+      <div class="field">
+       <label>时长模式</label>
+       <select class="select" data-ai-brief="timingMode">
+        <option value="auto"${b.timingMode === 'auto' ? ' selected' : ''}>指定全片总时长</option>
+        <option value="fixed"${b.timingMode === 'fixed' ? ' selected' : ''}>每镜固定时长</option>
+       </select>
+      </div>
+      <div class="field">
+       <label>${b.timingMode === 'fixed' ? '每镜秒数 (s)' : '目标总时长 (s)'}</label>
+       <input type="number" min="${b.timingMode === 'fixed' ? '0.5' : '2'}" step="${b.timingMode === 'fixed' ? '0.5' : '1'}" class="input" data-ai-brief-num="${b.timingMode === 'fixed' ? 'fixedDuration' : 'duration'}" value="${b.timingMode === 'fixed' ? b.fixedDuration : b.duration}" />
+      </div>
+     </div>` : ''}
+   </div>
+
+   <div class="ai-sub-block">
+    <div class="ai-sub-label">04 · 人物预选、对白 T1 与配乐 A2</div>
+    <div class="field-grid ${cols}">
+     <div class="field">
+      <label>人物面孔地域</label>
+      <select class="select" data-ai-brief="nationality">
+       ${AI_CAST_NATIONALITIES.map(([id, lb]) => `<option value="${esc(id)}"${id === b.nationality ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>颜值 / 角色视觉定位</label>
+      <select class="select" data-ai-brief="faceTier">
+       ${AI_CAST_FACE_TIERS.map(([id, lb]) => `<option value="${esc(id)}"${id === b.faceTier ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>皮肤纹理与磨皮控制</label>
+      <select class="select" data-ai-brief="skinRender">
+       ${AI_CAST_SKIN_RENDERS.map(([id, lb]) => `<option value="${esc(id)}"${id === b.skinRender ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>对白安排 (T1 轨)</label>
+      <select class="select" data-ai-brief="dialogueMode">
+       ${AI_DIALOGUE_MODES.map(([id, lb]) => `<option value="${esc(id)}"${id === b.dialogueMode ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>A2 配乐策略</label>
+      <select class="select" data-ai-brief="bgmMode">
+       ${AI_BGM_MODES.map(([id, lb]) => `<option value="${esc(id)}"${id === b.bgmMode ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field">
+      <label>预选配乐流派</label>
+      <select class="select" data-ai-brief="bgmStyle"${b.bgmMode === 'none' ? ' disabled' : ''}>
+       <option value="">由 AI 按情绪自动挑曲</option>
+       ${groupOptions('bgm').filter((o) => o.id !== 'none').map((o) => `<option value="${esc(o.id)}"${o.id === b.bgmStyle ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}
+      </select>
+     </div>
+     <div class="field full">
+      <label>对白语言与人物穿搭要求（选填）</label>
+      <input class="input" data-ai-brief="castNotes" value="${esc(b.castNotes)}" placeholder="例如：女主穿米色防雨风衣拎透明雨伞；配乐前期留白纯钢琴…" />
+     </div>
+    </div>
+   </div>
+
+   <div class="ai-sub-block">
+    <div class="ai-sub-label">05 · 全局负向词预选 (${b.negativePrompts.length} 项选中)</div>
+    <div class="chip-grid" style="margin-bottom:6px;">
+     ${groupOptions('negative').slice(0, 14).map((o) => {
+      const on = b.negativePrompts.includes(o.id);
+      return `<button type="button" class="chip-btn ${on ? 'neg-on' : ''}" data-ai-neg="${esc(o.id)}">${esc(o.label)}</button>`;
+     }).join('')}
+    </div>
+    <div class="field">
+     <input class="input" data-ai-brief="customNegative" value="${esc(b.customNegative)}" placeholder="附加自定义负向约束（逗号分隔，如：多余手掌、画面撕裂）" />
+    </div>
+   </div>
+  </section>`;
+}
+
+function renderAIResultPreview(place = 'editor') {
+ const res = appState.aiFlow.result;
+ if (!res?.plan) return '';
+ const plan = res.plan;
+ const totalDur = roundT((plan.shots || []).reduce((a, s) => a + (Number(s.duration) || 0), 0));
+ return `
+  <section class="ai-card ai-result-card">
+   <div class="ai-card-head">
+    <div class="ai-card-title">${uiIcon('check')}<span>方案已就绪：${esc(plan.title)}</span></div>
+    <span class="ai-pill ok">${esc(res.model)} · ${esc(String(res.thinkingLevel || 'high').toUpperCase())}</span>
+   </div>
+   <div class="ai-result-stats">
+    <span>角色 ${plan.characters.length}</span>
+    <span>场景 ${plan.scenes.length}</span>
+    <span>V1 分镜 ${plan.shots.length} 镜</span>
+    <span>T1 对白 ${plan.dialogueClips.length} 条</span>
+    <span>A1 音效 ${plan.audioClips.length} 条</span>
+    <span>A2 配乐 ${plan.bgmClips.length} 段</span>
+    <span>总时长 ${totalDur}s</span>
+   </div>
+   ${plan.logline ? `<div style="font-size:11.5px;color:var(--text-muted);line-height:1.5;margin:6px 0;">${esc(plan.logline)}</div>` : ''}
+   <div class="ai-shot-mini-list">
+    ${plan.shots.map((s, i) => `
+     <div class="ai-shot-mini-row">
+      <span class="ai-shot-idx">${String(i + 1).padStart(2, '0')}</span>
+      <div style="min-width:0;flex:1 1 auto;">
+       <div style="font-weight:600;font-size:11.5px;">${esc(s.title)} · ${s.duration}s</div>
+       <div style="font-size:11px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(s.action)}</div>
+      </div>
+     </div>`).join('')}
+   </div>
+   <div class="ai-btn-row" style="margin-top:10px;">
+    ${place === 'home' ? `
+     <button type="button" class="btn btn-compile-hero" style="flex:1;" data-action="ai-apply-plan" data-target="new">${uiIcon('storyboard-track')}<span>一键创建五轨草稿并进入剪辑台</span></button>` : `
+     <button type="button" class="btn btn-jy" style="flex:1;" data-action="ai-apply-plan" data-target="fill">${uiIcon('plus')}<span>填入当前时间轴 (可撤销)</span></button>
+     <button type="button" class="btn btn-sm" data-action="ai-apply-plan" data-target="new">新建草稿打开</button>`}
+   </div>
+  </section>`;
+}
+
+function renderAIGeneratePanel(place = 'editor') {
+ const b = appState.aiBrief;
+ const f = appState.aiFlow;
+ const badges = briefPreselectionSummary(b);
+ const ready = isAIApiConfigured();
+ return `
+  <section class="ai-card ${place === 'editor' ? 'compact' : ''}">
+   <div class="ai-card-head">
+    <div class="ai-card-title">${uiIcon('ai-spark')}<span>AI 辅助创作五轨方案</span></div>
+    <button type="button" class="btn btn-sm" data-action="ai-go-api-tab">${uiIcon('key')}<span>${ready ? aiConnBadgeText() : '填写 Google API Key'}</span></button>
+   </div>
+
+   <div class="field" style="margin-bottom:8px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+     <label for="aiIdeaInput" style="margin:0;">一句话故事创意 / 分镜需求</label>
+     <button type="button" class="btn btn-sm" data-action="ai-clear-idea">清空</button>
+    </div>
+    <textarea id="aiIdeaInput" class="textarea" rows="${place === 'editor' ? '4' : '3'}" data-ai-brief="idea" placeholder="描述你想拍的画面、人物情绪、核心冲突或台词（也可以先在预设选好风格/镜数/配乐，再写一句话即可）…">${esc(b.idea)}</textarea>
+   </div>
+
+   <div class="ai-sub-label" style="margin-bottom:4px;">快速填入题材（可选）</div>
+   <div class="ai-quick-tpl-row">
+    ${AI_STORY_TEMPLATES.map((t) => `<button type="button" class="chip-btn" data-ai-tpl="${esc(t.id)}">${esc(t.label)}</button>`).join('')}
+   </div>
+
+   <div class="ai-summary-strip">
+    <span style="font-size:11px;color:var(--text-dim);">当前生效预选：</span>
+    ${badges.map((tag) => `<span class="ai-summary-chip">${esc(tag)}</span>`).join('')}
+    ${place === 'editor' ? `<button type="button" class="ai-link-btn" data-action="ai-go-preselect-tab">修改预选条件 →</button>` : ''}
+   </div>
+
+   ${place === 'editor' ? `
+    <div class="ai-apply-box">
+     <div class="ai-sub-label" style="margin-bottom:5px;">写入作用域与方式</div>
+     <div class="ai-check-pills">
+      ${Object.entries({ characters: '角色', scenes: '场景', video: 'V1分镜', dialogue: 'T1对白', audio: 'A1音效', bgm: 'A2配乐', adjust: 'E1调节', negative: '负向词', specs: '规格' }).map(([k, lb]) => `
+       <label class="ai-check-pill ${appState.aiScopes[k] ? 'on' : ''}"><input type="checkbox" data-ai-scope="${esc(k)}"${appState.aiScopes[k] ? ' checked' : ''} /><span>${lb}</span></label>`).join('')}
+     </div>
+     <div class="ai-apply-mode-row">
+      <select class="select" id="aiApplyModeSelect" data-ai-apply-mode="1" style="flex:1;">
+       <option value="fill"${appState.aiApplyMode === 'fill' ? ' selected' : ''}>补充追加至当前时间轴（可 Ctrl+Z 撤销）</option>
+       <option value="new"${appState.aiApplyMode === 'new' ? ' selected' : ''}>生成后新建独立 2.0 草稿</option>
+      </select>
+      <label class="ai-check-pill ${appState.aiAutoApply ? 'on' : ''}"><input type="checkbox" data-ai-auto-apply="1"${appState.aiAutoApply ? ' checked' : ''} /><span>完成即自动填入</span></label>
+     </div>
+    </div>` : `
+    <div class="ai-apply-box">
+     <label class="ai-check-pill ${appState.aiAutoApply ? 'on' : ''}"><input type="checkbox" data-ai-auto-apply="1"${appState.aiAutoApply ? ' checked' : ''} /><span>生成完成后自动创建草稿并进入 2.0 五轨剪辑台</span></label>
+    </div>`}
+
+   <div class="ai-btn-row" style="margin-top:10px;">
+    <button type="button" class="btn btn-compile-hero" style="flex:1;justify-content:center;" data-action="ai-generate"${f.busy ? ' disabled' : ''}>
+     ${uiIcon('ai-spark')}
+     <span>${f.busy ? 'Hydrogen 深度思考生成中…' : `生成五轨方案 (${esc(appState.aiConn.model === DEFAULT_AI_MODEL ? 'Hydrogen' : appState.aiConn.model)} · ${esc(String(appState.aiConn.thinkingLevel || 'high').toUpperCase())})`}</span>
+    </button>
+    ${f.busy ? `<button type="button" class="btn btn-danger" data-action="ai-cancel">取消等待</button>` : ''}
+   </div>
+
+   ${f.busy ? `<div id="aiWaitStatus" class="modal-alert info" style="margin-top:8px;margin-bottom:0;">${esc(aiWaitText())}</div>` : ''}
+   ${f.error ? `<div class="modal-alert error" style="margin-top:8px;margin-bottom:0;">${esc(f.error)}</div>` : ''}
+  </section>
+  ${renderAIResultPreview(place)}`;
+}
+
+function renderHomeAIStudio() {
+ return `
+  <div class="home-ai-header">
+   <div>
+    <div style="display:inline-flex;align-items:center;gap:8px;font-size:16px;font-weight:800;">
+     ${uiIcon('ai-spark', 'title-svg')}
+     <span>镜序 2.0 · 内置 AI 辅助多轨导演台</span>
+     <span class="ai-pill ${appState.aiConn.verified ? 'ok' : isAIApiConfigured() ? 'warm' : 'idle'}">${esc(aiConnBadgeText())}</span>
+    </div>
+    <div style="font-size:12px;color:var(--text-muted);margin-top:3px;">支持连接你自己的 Google API（默认 <code>gemini-4-hydrogen</code> · <code>thinkingLevel: high</code>），提前预选画风、分镜节奏、人物肤质与配乐，一键生成完整 5 轨可剪辑草稿。</div>
+   </div>
+   <button type="button" class="btn btn-sm" data-home-tab="home">${uiIcon('home')}<span>返回首页草稿</span></button>
+  </div>
+  <div class="home-ai-layout">
+   <div class="home-ai-col">
+    ${renderAIApiPanel(false)}
+    ${renderAIGeneratePanel('home')}
+   </div>
+   <div class="home-ai-col">
+    ${renderAIPreselectPanel(false)}
+   </div>
+  </div>`;
+}
+
+async function handleTestAIConnection() {
+ if (appState.aiConn.testing) return;
+ if (!appState.aiConn.apiKey?.trim() && !(appState.aiConn.transport === 'server' && appState.aiConn.serverHasKey)) {
+  appState.aiConn.statusMsg = '请先粘贴你的 Google API Key 再点击测试连接。';
+  appState.aiConn.statusError = true;
+  render(true);
+  document.getElementById('aiApiKeyInput')?.focus();
+  return;
+ }
+ appState.aiConn.testing = true;
+ appState.aiConn.statusMsg = `正在验证模型 ${appState.aiConn.model || DEFAULT_AI_MODEL} 的访问权限…`;
+ appState.aiConn.statusError = false;
+ render(true);
+ try {
+  const res = await testGoogleConnection({
+   apiKey: appState.aiConn.apiKey,
+   model: appState.aiConn.model,
+   transport: appState.aiConn.transport
+  });
+  appState.aiConn.verified = Boolean(res.verified);
+  appState.aiConn.model = res.model || appState.aiConn.model;
+  appState.aiConn.statusMsg = `连接成功：已确认模型 ${appState.aiConn.model}（思考档位：${String(appState.aiConn.thinkingLevel).toUpperCase()}）可用，现在可以开始 AI 辅助生成。`;
+  appState.aiConn.statusError = false;
+  persistAppPrefs();
+  showToast('Google API 连接验证通过');
+ } catch (err) {
+  appState.aiConn.verified = false;
+  appState.aiConn.statusMsg = err.message || '连接验证未通过，请检查 Key 与网络设置。';
+  appState.aiConn.statusError = true;
+ } finally {
+  appState.aiConn.testing = false;
+  render(true);
+ }
+}
+
+async function handleApplyAIPlan(targetMode = null) {
+ const res = appState.aiFlow.result;
+ if (!res?.plan) { showToast('尚未生成可应用的 AI 方案'); return; }
+ const effectiveMode = targetMode || (appState.screen === 'home' ? 'new' : appState.aiApplyMode);
+ stopPlayback();
+ const contextProj = appState.screen === 'editor' ? appState.project : null;
+ if (effectiveMode === 'fill' && appState.screen === 'editor') {
+  pushUndo(null, 'AI 辅助填入五轨内容');
+ }
+ const applied = applyNleAIPlan(contextProj, res.plan, {
+  mode: effectiveMode,
+  scopes: appState.aiScopes,
+  reuseExisting: appState.aiBrief.reuseCurrentAssets
+ });
+ appState.project = applied.project;
+ if (effectiveMode === 'new') {
+  appState.history = [];
+  appState.future = [];
+ }
+ appState.multiSelected = [];
+ appState.screen = 'editor';
+ await saveProject(appState.project);
+ lastProject(appState.project.id);
+ await refreshDraftsCache();
+ render();
+ const st = applied.stats;
+ showToast(`已写入五轨时间轴：V1 +${st.shotsAdded} 镜 · T1 +${st.dialogueAdded} · A1 +${st.audioAdded} · A2 +${st.bgmAdded}`);
+}
+
+async function handleRunAIGenerate() {
+ if (appState.aiFlow.busy) return;
+ if (!isAIApiConfigured()) {
+  appState.aiConn.statusMsg = '请先在这里粘贴你自己的 Google API Key（仅存页面内存，支持浏览器直连）。';
+  appState.aiConn.statusError = true;
+  if (appState.screen === 'editor') appState.resSubCat = 'api';
+  render(true);
+  document.getElementById('aiApiKeyInput')?.focus();
+  showToast('请先填写 Google API Key');
+  return;
+ }
+ if (String(appState.aiBrief.idea || '').trim().length < 2) {
+  showToast('请先输入创作想法或点选上方快速题材');
+  document.getElementById('aiIdeaInput')?.focus();
+  return;
+ }
+
+ const controller = new AbortController();
+ clearInterval(appState.aiFlow.timer);
+ appState.aiFlow.busy = true;
+ appState.aiFlow.error = '';
+ appState.aiFlow.startedAt = Date.now();
+ appState.aiFlow.thoughtChars = 0;
+ appState.aiFlow.answerChars = 0;
+ appState.aiFlow.controller = controller;
+ appState.aiFlow.timer = setInterval(syncAIProgressDom, 1000);
+ render();
+
+ try {
+  const projCtx = appState.screen === 'editor' ? {
+   format: displayAspectLabel(appState.project),
+   resolution: displayResolutionLabel(appState.project),
+   fps: appState.project.fps,
+   characters: (appState.project.characters || []).slice(0, 8),
+   scenes: (appState.project.scenes || []).slice(0, 8)
+  } : {};
+
+  const out = await generateNleAIPlan({
+   brief: appState.aiBrief,
+   projectContext: projCtx,
+   connection: appState.aiConn,
+   onProgress: ({ thoughtChars, answerChars }) => {
+    appState.aiFlow.thoughtChars = thoughtChars;
+    appState.aiFlow.answerChars = answerChars;
+    syncAIProgressDom();
+   }
+  }, { signal: controller.signal });
+
+  appState.aiFlow.result = out;
+  appState.aiConn.verified = true;
+  clearInterval(appState.aiFlow.timer);
+  appState.aiFlow.busy = false;
+  appState.aiFlow.controller = null;
+
+  if (appState.aiAutoApply) {
+   await handleApplyAIPlan(appState.screen === 'home' ? 'new' : appState.aiApplyMode);
+  } else {
+   render();
+   showToast(`AI 方案已生成（V1 共 ${out.plan.shots.length} 镜），可预览后点击写入时间轴`);
+  }
+ } catch (err) {
+  appState.aiFlow.error = err.message || 'AI 生成未能完成，请重试。';
+  clearInterval(appState.aiFlow.timer);
+  appState.aiFlow.busy = false;
+  appState.aiFlow.controller = null;
+  render();
+  showToast(appState.aiFlow.error);
+ }
+}
+
 function renderHomeScreen() {
  const q = appState.draftFilter.trim().toLowerCase();
  const visibleDrafts = (appState.drafts || []).filter((d) => !q || String(d.title || '').toLowerCase().includes(q));
@@ -437,6 +1034,8 @@ function renderHomeScreen() {
      </div>`}
     ${renderTrashSection()}
    </section>`;
+ } else if (appState.homeTab === 'ai') {
+  mainHtml = renderHomeAIStudio();
  } else if (appState.homeTab === 'square') {
   mainHtml = `
    <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -496,12 +1095,13 @@ function renderHomeScreen() {
      </div>
      <nav class="home-nav">
       <button class="home-nav-btn ${appState.homeTab === 'home' ? 'active' : ''}" data-home-tab="home">${uiIcon('home')}<span>首页</span></button>
+      <button class="home-nav-btn ${appState.homeTab === 'ai' ? 'active' : ''}" data-home-tab="ai">${uiIcon('ai-spark')}<span>AI 辅助生成</span>${isAIApiConfigured() ? '<span class="nav-dot-on" title="API 已配置"></span>' : ''}</button>
       <button class="home-nav-btn ${appState.homeTab === 'square' ? 'active' : ''}" data-home-tab="square">${uiIcon('gallery')}<span>广场</span></button>
       <button class="home-nav-btn ${appState.homeTab === 'cloud' ? 'active' : ''}" data-home-tab="cloud">${uiIcon('layers')}<span>我的云空间</span></button>
      </nav>
     </div>
     <div class="home-sidebar-foot">
-     <div><span class="status-dot"></span><b>0 AI 依赖 · 纯手动剪辑</b></div>
+     <div><span class="status-dot"></span><b>0 AI 依赖 · 内置可选 AI</b></div>
      <div>免登录 · 数据本地自动存储</div>
     </div>
    </aside>
@@ -571,6 +1171,18 @@ function renderResourceDock() {
      </div>
      <span class="track-badge ${esc(item.track)}">${item.track === 'video' ? 'V1' : item.track === 'dialogue' ? 'T1' : item.track === 'audio' ? 'A1' : item.track === 'bgm' ? 'A2' : 'E1'} +</span>
     </div>`).join('')}`;
+ } else if (tab === 'ai') {
+  cats = [
+   { id: 'compose', label: 'AI 生成' },
+   { id: 'preselect', label: '提前预选' },
+   { id: 'api', label: 'API 配置' }
+  ];
+  if (!cats.some((c) => c.id === appState.resSubCat)) appState.resSubCat = 'compose';
+  contentHtml = appState.resSubCat === 'api'
+   ? renderAIApiPanel(true)
+   : appState.resSubCat === 'preselect'
+    ? renderAIPreselectPanel(true)
+    : renderAIGeneratePanel('editor');
  } else if (tab === 'style') {
   cats = [
    { id: 'look', label: '视觉美学' },
@@ -686,12 +1298,17 @@ function renderResourceDock() {
      ${cats.map((c) => `<button class="res-cat-btn ${appState.resSubCat === c.id ? 'active' : ''}" data-res-cat="${esc(c.id)}">${esc(c.label)}</button>`).join('')}
     </div>
     <div class="res-content">
-     <div class="res-search-row">
-      <div class="search-field-wrap">
-       ${uiIcon('search', 'search-svg')}
-       <input id="resSearchInput" class="input" placeholder="搜索当前分类…" value="${esc(appState.resSearch)}" />
-      </div>
-     </div>
+     ${tab === 'ai' ? `
+      <div class="res-ai-status-bar">
+       <span>${uiIcon('ai-spark', 'inline-lock-svg')} 模型：<b>${esc(appState.aiConn.model === DEFAULT_AI_MODEL ? 'Hydrogen' : appState.aiConn.model)}</b> · <b>${esc(String(appState.aiConn.thinkingLevel || 'high').toUpperCase())}</b></span>
+       <button type="button" class="ai-link-btn" data-action="ai-go-api-tab">${isAIApiConfigured() ? 'API 已配置' : '配置 API Key'}</button>
+      </div>` : `
+      <div class="res-search-row">
+       <div class="search-field-wrap">
+        ${uiIcon('search', 'search-svg')}
+        <input id="resSearchInput" class="input" placeholder="搜索当前分类…" value="${esc(appState.resSearch)}" />
+       </div>
+      </div>`}
      <div class="res-scroll">${contentHtml}</div>
     </div>
    </div>
@@ -1590,6 +2207,28 @@ function renderModal() {
    </div>`;
  }
 
+ if (m.type === 'ai-guide') {
+  return `
+   <div class="modal-backdrop" data-close-modal="1">
+    <div class="modal-box">
+     <div class="modal-head"><span>${uiIcon('ai-spark', 'modal-title-svg')}<span>内置 Google Hydrogen AI 接入说明</span></span><button class="btn btn-sm" data-close-modal="1">${uiIcon('close')}</button></div>
+     <div class="modal-body" style="font-size:12.5px;line-height:1.65;color:var(--text-main);">
+      <div class="modal-alert info">本工作台坚持 <b>0 AI 强制依赖</b>（随时可用左侧方块纯手动从 00:00 剪辑），同时在首页与工作台左侧内置可选 AI 导演助手。</div>
+      <ul style="padding-left:18px;margin:8px 0 12px;color:var(--text-muted);display:flex;flex-direction:column;gap:6px;">
+       <li><b>默认模型与推理深度：</b>默认调用 Google <code>gemini-4-hydrogen</code> 并开启 <code>thinkingLevel: "high"</code> 高强度深度思考推理，严格统筹角色外貌、首尾承接与五轨时间对齐。</li>
+       <li><b>浏览器直连模式：</b>适用于 GitHub Pages 纯静态网页及本地预览。在页面填写你在 Google AI Studio 获取的 API Key 后直接请求官方接口，消耗你自己的额度。</li>
+       <li><b>密钥隐私保障：</b>你的 API Key <b>仅暂存于当前标签页内存</b>，绝不会写入草稿工程、IndexedDB 或导出的 <code>.jingxu2.json</code> 文件；刷新页面后需重新粘贴。</li>
+       <li><b>提前预选生成：</b>支持先选好画面美学、色彩影调、运镜偏好、分镜数、人物颜值与肤质档位、A2 配乐流派及负向词，AI 将严格按所选生成 <code>V1/T1/A1/A2/E1</code> 五轨内容。</li>
+      </ul>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px;">
+       <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" class="btn btn-sm">前往 Google AI Studio 获取密钥</a>
+       <button class="btn btn-jy" data-close-modal="1">知道了</button>
+      </div>
+     </div>
+    </div>
+   </div>`;
+ }
+
  return '';
 }
 
@@ -1601,6 +2240,9 @@ function focusDescriptor(el) {
  if (el.dataset?.projField) return { sel: `[data-proj-field="${el.dataset.projField}"]` };
  if (el.dataset?.customAspect) return { sel: `[data-custom-aspect="${el.dataset.customAspect}"]` };
  if (el.dataset?.customRes) return { sel: `[data-custom-res="${el.dataset.customRes}"]` };
+ if (el.dataset?.aiConn) return { sel: `[data-ai-conn="${el.dataset.aiConn}"]` };
+ if (el.dataset?.aiBrief) return { sel: `[data-ai-brief="${el.dataset.aiBrief}"]` };
+ if (el.dataset?.aiBriefNum) return { sel: `[data-ai-brief-num="${el.dataset.aiBriefNum}"]` };
  return null;
 }
 
@@ -1818,6 +2460,7 @@ function downloadBlob(filename, content, mime = 'text/plain;charset=utf-8') {
    DELEGATED EVENTS
 ========================================================= */
 rootEl.addEventListener('focusin', (e) => {
+ if (e.target.closest('[data-ai-conn],[data-ai-brief],[data-ai-brief-num],[data-ai-brief-bool],[data-ai-scope],[data-ai-apply-mode],[data-ai-auto-apply]')) return;
  if (e.target.closest('input, textarea, select') && !appState.pendingEditSnapshot) {
   appState.pendingEditSnapshot = { label: '参数编辑', project: clone(appState.project) };
  }
@@ -1825,6 +2468,32 @@ rootEl.addEventListener('focusin', (e) => {
 
 rootEl.addEventListener('input', (e) => {
  const el = e.target;
+ const aiConnField = el.dataset.aiConn;
+ if (aiConnField) {
+  if (aiConnField === 'apiKey') {
+   appState.aiConn.apiKey = el.value;
+   appState.aiConn.verified = false;
+  } else if (aiConnField === 'model') {
+   appState.aiConn.model = el.value;
+   appState.aiConn.verified = false;
+  }
+  return;
+ }
+ const aiBriefField = el.dataset.aiBrief;
+ if (aiBriefField && el.tagName !== 'SELECT') {
+  appState.aiBrief[aiBriefField] = el.value;
+  persistAppPrefs();
+  return;
+ }
+ if (el.dataset.aiBriefNum) {
+  const num = Number(el.value);
+  if (Number.isFinite(num)) {
+   appState.aiBrief[el.dataset.aiBriefNum] = num;
+   persistAppPrefs();
+  }
+  return;
+ }
+
  const clipField = el.dataset.clipField;
  const projField = el.dataset.projField;
  const charDraft = el.dataset.charDraft;
@@ -1870,8 +2539,70 @@ rootEl.addEventListener('input', (e) => {
  }
 });
 
-rootEl.addEventListener('change', (e) => {
+rootEl.addEventListener('change', async (e) => {
  const el = e.target;
+ if (el.dataset.aiConn) {
+  const k = el.dataset.aiConn;
+  if (k === 'apiKey') {
+   appState.aiConn.apiKey = el.value.trim();
+   appState.aiConn.verified = false;
+  } else if (k === 'model') {
+   appState.aiConn.model = el.value.trim() || DEFAULT_AI_MODEL;
+   appState.aiConn.verified = false;
+  } else if (k === 'thinkingLevel') {
+   appState.aiConn.thinkingLevel = el.value || DEFAULT_THINKING_LEVEL;
+  } else if (k === 'transport') {
+   appState.aiConn.transport = el.value === 'server' ? 'server' : 'browser';
+   if (appState.aiConn.transport === 'server') {
+    await probeServerConfigIfLocal(true);
+    if (appState.aiConn.staticHost) {
+     appState.aiConn.statusMsg = '当前页面运行于纯静态托管（无后端 /api 接口），建议切回「浏览器直连」。';
+     appState.aiConn.statusError = true;
+    }
+   }
+  }
+  persistAppPrefs();
+  render(true);
+  return;
+ }
+ if (el.dataset.aiBrief) {
+  appState.aiBrief[el.dataset.aiBrief] = el.value;
+  appState.aiBrief = normalizeAIBrief(appState.aiBrief);
+  persistAppPrefs();
+  if (el.tagName === 'SELECT') render(true);
+  return;
+ }
+ if (el.dataset.aiBriefNum) {
+  const num = Number(el.value);
+  if (Number.isFinite(num)) appState.aiBrief[el.dataset.aiBriefNum] = num;
+  appState.aiBrief = normalizeAIBrief(appState.aiBrief);
+  persistAppPrefs();
+  render(true);
+  return;
+ }
+ if (el.dataset.aiBriefBool) {
+  appState.aiBrief[el.dataset.aiBriefBool] = Boolean(el.checked);
+  appState.aiBrief = normalizeAIBrief(appState.aiBrief);
+  persistAppPrefs();
+  render(true);
+  return;
+ }
+ if (el.dataset.aiScope) {
+  appState.aiScopes[el.dataset.aiScope] = Boolean(el.checked);
+  render(true);
+  return;
+ }
+ if (el.dataset.aiApplyMode) {
+  appState.aiApplyMode = el.value === 'new' ? 'new' : 'fill';
+  render(true);
+  return;
+ }
+ if (el.dataset.aiAutoApply) {
+  appState.aiAutoApply = Boolean(el.checked);
+  render(true);
+  return;
+ }
+
  const clip = selectedClipObj();
  const clipField = el.dataset.clipField;
  const clipNum = el.dataset.clipNum;
@@ -2386,6 +3117,30 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
 
+ const aiTplBtn = target.closest('[data-ai-tpl]');
+ if (aiTplBtn) {
+  const tpl = AI_STORY_TEMPLATES.find((x) => x.id === aiTplBtn.dataset.aiTpl);
+  if (tpl) {
+   appState.aiBrief = normalizeAIBrief({ ...appState.aiBrief, ...tpl.brief, idea: tpl.idea });
+   persistAppPrefs();
+   render(true);
+   showToast(`已套用题材预选「${tpl.label}」`);
+  }
+  return;
+ }
+
+ const aiNegBtn = target.closest('[data-ai-neg]');
+ if (aiNegBtn) {
+  const id = aiNegBtn.dataset.aiNeg;
+  const set = new Set(appState.aiBrief.negativePrompts || []);
+  if (set.has(id)) set.delete(id);
+  else set.add(id);
+  appState.aiBrief = normalizeAIBrief({ ...appState.aiBrief, negativePrompts: [...set] });
+  persistAppPrefs();
+  render(true);
+  return;
+ }
+
  const actBtn = target.closest('[data-action]');
  if (!actBtn) return;
  const action = actBtn.dataset.action;
@@ -2597,6 +3352,82 @@ rootEl.addEventListener('click', async (e) => {
  if (action === 'open-help-modal') {
   appState.modal = { type: 'help' };
   render();
+  return;
+ }
+
+ // Built-in AI Studio Actions
+ if (action === 'ai-toggle-key-vis') {
+  appState.aiConn.showKey = !appState.aiConn.showKey;
+  render(true);
+  return;
+ }
+
+ if (action === 'ai-test-conn') {
+  await handleTestAIConnection();
+  return;
+ }
+
+ if (action === 'ai-disconnect') {
+  appState.aiConn.apiKey = '';
+  appState.aiConn.verified = false;
+  appState.aiConn.statusMsg = '已断开并清除页面内存中的 API Key。';
+  appState.aiConn.statusError = false;
+  render(true);
+  showToast('已清除页面内存中的 Google API Key');
+  return;
+ }
+
+ if (action === 'ai-open-guide') {
+  appState.modal = { type: 'ai-guide' };
+  render();
+  return;
+ }
+
+ if (action === 'ai-clear-idea') {
+  appState.aiBrief.idea = '';
+  persistAppPrefs();
+  render();
+  document.getElementById('aiIdeaInput')?.focus();
+  return;
+ }
+
+ if (action === 'ai-go-api-tab') {
+  if (appState.screen === 'editor') {
+   appState.resTab = 'ai';
+   appState.resSubCat = 'api';
+   render();
+  } else {
+   appState.homeTab = 'ai';
+   render();
+  }
+  requestAnimationFrame(() => document.getElementById('aiApiKeyInput')?.focus());
+  return;
+ }
+
+ if (action === 'ai-go-preselect-tab') {
+  if (appState.screen === 'editor') {
+   appState.resTab = 'ai';
+   appState.resSubCat = 'preselect';
+   render();
+  }
+  return;
+ }
+
+ if (action === 'ai-generate') {
+  await handleRunAIGenerate();
+  return;
+ }
+
+ if (action === 'ai-cancel') {
+  if (appState.aiFlow.busy && appState.aiFlow.controller) {
+   appState.aiFlow.controller.abort(new Error('USER_CANCELLED'));
+  }
+  return;
+ }
+
+ if (action === 'ai-apply-plan') {
+  const tgt = actBtn.dataset.target || null;
+  await handleApplyAIPlan(tgt);
   return;
  }
 
@@ -3137,8 +3968,13 @@ async function boot() {
   if (prefs.zoom) appState.project.zoom = prefs.zoom;
   if (prefs.outputMode) appState.project.outputMode = prefs.outputMode;
   if (prefs.outputLang) appState.project.outputLang = prefs.outputLang;
+  if (prefs.aiModel) appState.aiConn.model = String(prefs.aiModel);
+  if (prefs.aiThinkingLevel) appState.aiConn.thinkingLevel = String(prefs.aiThinkingLevel);
+  if (prefs.aiTransport) appState.aiConn.transport = prefs.aiTransport === 'server' ? 'server' : 'browser';
+  if (prefs.aiBrief) appState.aiBrief = normalizeAIBrief(prefs.aiBrief);
  }
  await refreshDraftsCache();
+ probeServerConfigIfLocal(false);
  appState.screen = 'home';
  appState.homeTab = 'home';
  render();

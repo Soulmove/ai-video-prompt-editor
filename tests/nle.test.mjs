@@ -7,6 +7,24 @@ import { fileURLToPath } from 'node:url';
 import { NLE_SQUARE_TEMPLATES, GROUPS, CHARACTER_FIELDS } from '../dist/nle-catalog.mjs';
 import { renderOptionSwatch } from '../dist/nle-swatches.mjs';
 import { ICON_IDS, uiIcon } from '../dist/nle-icons.mjs';
+import {
+ AI_STORY_TEMPLATES,
+ normalizeAIBrief,
+ resolveVisualOverrides,
+ briefPreselectionSummary
+} from '../dist/nle-ai-brief.mjs';
+import {
+ DEFAULT_AI_MODEL,
+ DEFAULT_THINKING_LEVEL,
+ normalizeGoogleKey,
+ normalizeGoogleModel,
+ nlePlanSchema,
+ testGoogleConnection,
+ generateNleAIPlan,
+ normalizeNleAIPlan,
+ applyNleAIPlan
+} from '../dist/nle-ai.mjs';
+import { handleApiRoute } from '../worker/index.mjs';
 
 import {
  createBlankProject,
@@ -251,6 +269,8 @@ test('Lucide linear SVG icon pack covers all UI references and replaces emoji gl
  const iconsSvg = fs.readFileSync(path.join(rootDir, 'dist', 'icons.svg'), 'utf8');
  const appJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-app.mjs'), 'utf8');
  const modelJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-model.mjs'), 'utf8');
+ const aiBriefJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-ai-brief.mjs'), 'utf8');
+ const aiJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-ai.mjs'), 'utf8');
 
  for (const id of ICON_IDS) {
   assert.ok(indexHtml.includes(`id="i-${id}"`), `Missing symbol i-${id} in index.html`);
@@ -266,6 +286,8 @@ test('Lucide linear SVG icon pack covers all UI references and replaces emoji gl
  assert.deepEqual(appJs.match(emojiRe), null);
  assert.deepEqual(modelJs.match(emojiRe), null);
  assert.deepEqual(indexHtml.match(emojiRe), null);
+ assert.deepEqual(aiBriefJs.match(emojiRe), null);
+ assert.deepEqual(aiJs.match(emojiRe), null);
 });
 
 test('advancePlayhead progresses continuously at 60Hz without zero-quantization stalling', () => {
@@ -397,4 +419,189 @@ test('extra tracks, track lock/mute/hide, cloneProject, and batch edit operation
 
  assert.equal(removeExtraTrack(p, 'video').ok, false);
  assert.equal(removeExtraTrack(p, v2.key).ok, true);
+});
+
+test('AI pre-selection brief helpers, key normalization, and Hydrogen defaults behave safely', () => {
+ assert.equal(DEFAULT_AI_MODEL, 'gemini-4-hydrogen');
+ assert.equal(DEFAULT_THINKING_LEVEL, 'high');
+ assert.ok(AI_STORY_TEMPLATES.length >= 4);
+
+ assert.equal(normalizeGoogleKey('Bearer "AIzaSyExampleKey123456"'), 'AIzaSyExampleKey123456');
+ assert.throws(() => normalizeGoogleKey('   '), /Google API Key/);
+ assert.equal(normalizeGoogleModel('models/gemini-4-hydrogen'), 'gemini-4-hydrogen');
+ assert.equal(normalizeGoogleModel(''), 'gemini-4-hydrogen');
+
+ const brief = normalizeAIBrief({
+  idea: '雨夜重逢',
+  visualPreset: 'hk_neon',
+  color: 'hk_emerald',
+  bgmMode: 'exact',
+  bgmStyle: 'solo_piano',
+  customShotTiming: true,
+  shotCount: 3,
+  timingMode: 'fixed',
+  fixedDuration: 5,
+  faceTier: 'hk_retro_star',
+  skinRender: 'natural_pores',
+  negativePrompts: ['identity', 'face_deform', 'not_valid_id']
+ });
+ assert.deepEqual(brief.negativePrompts, ['identity', 'face_deform']);
+ const vis = resolveVisualOverrides(brief);
+ assert.equal(vis.look, 'hk_cinema');
+ assert.equal(vis.color, 'hk_emerald');
+ const badges = briefPreselectionSummary(brief);
+ assert.ok(badges.some((b) => b.includes('3镜')));
+ const schema = nlePlanSchema();
+ assert.ok(schema.properties.shots && schema.properties.audioClips && schema.properties.bgmClips && schema.properties.adjustClips);
+});
+
+test('generateNleAIPlan sends gemini-4-hydrogen with thinkingLevel high over SSE and enforces pre-selections', async () => {
+ let capturedUrl = '';
+ let capturedHeaders = null;
+ let capturedBody = null;
+
+ const rawPlanObj = {
+  title: '雨夜便利店重逢',
+  logline: '暴雨夜两人再次在便利店廊檐相遇',
+  format: '9:16',
+  resolution: '1080P',
+  fps: 24,
+  chainLastFrame: true,
+  negativePrompts: ['warp'],
+  customNegative: '路灯过曝',
+  characters: [{
+   ref: 'c1', name: '林夏', role: '主角', age: '26', gender: '女', height: '165cm', build: '纤细',
+   occupation: '插画师', appearance: '拎透明雨伞', skin: '自然肤色', face: '鹅蛋脸', eyes: '深棕',
+   brows: '平直细眉', nose: '秀气', lips: '自然唇形', hair: '齐肩短发', hairColor: '黑', makeup: '淡妆',
+   outfit: '米灰风衣', accessories: '透明雨伞', habits: '捏伞柄', posture: '肩微收', voice: '轻柔', language: '普通话', lockIdentity: true
+  }],
+  scenes: [{
+   ref: 's1', name: '巷口便利店', location: '便利店外廊檐', description: '潮湿水洼倒映霓虹',
+   foreground: '玻璃雨滴', background: '绿红霓虹招牌', dynamics: '雨滴斜落', sound: '雨声与冰箱嗡鸣',
+   time: 'night', weather: 'rain', lightSource: 'neon', lightDirection: 'side', lightQuality: 'soft'
+  }],
+  shots: [
+   {
+    title: '廊檐躲雨', duration: 8, action: '林夏收伞抖落雨水', props: '透明雨伞',
+    startState: '站在雨幕中', endState: '走入廊檐甩伞', framing: 'mediumFull', angle: 'eye', composition: 'thirds',
+    move: 'push', moveDistance: 'subtle', speed: 'slow', stability: 'dolly', zoom: 'none', lens: '35', focus: 'subject',
+    style: 'cinema', color: 'warm', medium: 'digital', texture: [], lightSource: 'neon', lightDirection: 'side',
+    lightQuality: 'soft', weather: 'rain', time: 'night', emotion: 'hesitate', micro: 'breath',
+    characterRefs: ['c1'], sceneRef: 's1', characterActions: '甩掉伞上水珠', transitionIn: 'cut', transitionDur: 0.9,
+    transitionOut: '', transitionOutDur: 0, refNote: ''
+   },
+   {
+    title: '回头认出旧友', duration: 6, action: '她听见脚步回头望去', props: '热豆浆纸杯',
+    startState: '', endState: '目光微亮定格', framing: 'close', angle: 'eye', composition: 'center',
+    move: 'stationary', moveDistance: 'none', speed: 'even', stability: 'tripod', zoom: 'none', lens: '50', focus: 'eyes',
+    style: '', color: '', medium: '', texture: [], lightSource: 'neon', lightDirection: 'side',
+    lightQuality: 'soft', weather: 'rain', time: 'night', emotion: 'surprise', micro: 'gaze',
+    characterRefs: ['c1'], sceneRef: 's1', characterActions: '停下回头', transitionIn: 'cut', transitionDur: 0.4,
+    transitionOut: 'fade_out', transitionOutDur: 0.8, refNote: ''
+   }
+  ],
+  dialogueClips: [
+   { start: 6.2, duration: 2.5, speakerRef: 'c1', speakerName: '林夏', language: '普通话', delivery: '轻声停顿', subtitlePos: 'bottom', subtitleStyle: '简约白字', text: '你怎么会在这里？' }
+  ],
+  audioClips: [
+   { start: 0, duration: 5, kind: 'ambience', cue: '暴雨夜持续击打伞面声', intensity: '中低铺底', spatial: '环绕前景', fadeIn: 0.4, fadeOut: 0.4 },
+   { start: 5.5, duration: 1.8, kind: 'sfx', cue: '右侧积水里两声清脆皮鞋踩水声', intensity: '先声夺人', spatial: '画外右侧由远及近', fadeIn: 0.1, fadeOut: 0.2 }
+  ],
+  bgmClips: [
+   { start: 1, duration: 9, style: 'suspense_strings', mood: '情绪克制', duckUnderDialogue: true, fadeIn: 0.6, fadeOut: 1.0, customNote: '' }
+  ],
+  adjustClips: [
+   { start: 0, duration: 10, label: '全片港风定调', lookOverride: '', colorOverride: '', lightOverride: '', cameraModifier: '轻微慢快门微拖影', slowMo: '', negativeOverride: '' }
+  ]
+ };
+
+ const ssePayload = [
+  `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ thought: true, text: '先推演五轨时间轴...' }] } }] })}\n\n`,
+  `data: ${JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(rawPlanObj) }] } }] })}\n\n`
+ ].join('');
+
+ const mockFetch = async (url, init) => {
+  capturedUrl = url;
+  capturedHeaders = init.headers;
+  capturedBody = JSON.parse(init.body);
+  return new Response(ssePayload, { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } });
+ };
+
+ const out = await generateNleAIPlan({
+  brief: {
+   idea: '雨夜重逢',
+   visualPreset: 'hk_neon',
+   customShotTiming: true,
+   shotCountMode: 'exact',
+   shotCount: 2,
+   timingMode: 'fixed',
+   fixedDuration: 5,
+   chainLastFrame: true,
+   bgmMode: 'exact',
+   bgmStyle: 'solo_piano',
+   faceTier: 'hk_retro_star',
+   skinRender: 'natural_pores',
+   negativePrompts: ['face_deform']
+  },
+  connection: { apiKey: 'AIzaSyMockBrowserKey999', transport: 'browser' }
+ }, { fetcher: mockFetch });
+
+ assert.match(capturedUrl, /models\/gemini-4-hydrogen:streamGenerateContent\?alt=sse/);
+ assert.equal(capturedHeaders['x-goog-api-key'], 'AIzaSyMockBrowserKey999');
+ assert.equal(capturedBody.generationConfig.thinkingConfig.thinkingLevel, 'high');
+ assert.equal(capturedBody.generationConfig.thinkingConfig.includeThoughts, true);
+
+ // Verify pre-selection enforcement
+ assert.equal(out.plan.shots.length, 2);
+ assert.equal(out.plan.shots[0].duration, 5);
+ assert.equal(out.plan.shots[1].duration, 5);
+ assert.equal(out.plan.shots[0].transitionDur, 0);
+ assert.equal(out.plan.shots[1].transitionIn, 'continuous');
+ assert.match(out.plan.shots[1].startState, /走入廊檐甩伞/);
+ assert.equal(out.plan.shots[0].style, 'hk_cinema');
+ assert.equal(out.plan.bgmClips[0].style, 'solo_piano');
+ assert.ok(out.plan.negativePrompts.includes('face_deform'));
+ assert.ok(out.plan.negativePrompts.includes('skin'));
+
+ // Verify applyNleAIPlan builds a clean 5-track project + merge preserves locked characters
+ const created = applyNleAIPlan(null, out.plan, { mode: 'new' });
+ assert.equal(created.project.tracks.video.length, 2);
+ assert.equal(created.project.tracks.dialogue.length, 1);
+ assert.equal(created.project.tracks.audio.length, 2);
+ assert.equal(created.project.tracks.bgm.length, 1);
+ assert.equal(created.project.tracks.adjust.length, 1);
+ assert.ok(created.project.tracks.audio[1].start > 0);
+ assert.equal(created.project.tracks.bgm[0].style, 'solo_piano');
+
+ // Test locked character preservation when filling into existing timeline
+ created.project.characters[0].lockIdentity = true;
+ created.project.characters[0].outfit = '手动锁定风衣样式';
+ const fillRes = applyNleAIPlan(created.project, out.plan, { mode: 'fill', reuseExisting: true });
+ assert.equal(fillRes.project.characters[0].outfit, '手动锁定风衣样式');
+ assert.equal(fillRes.project.tracks.video.length, 4);
+});
+
+test('testGoogleConnection and worker /api/ai routes proxy cleanly without leaking keys', async () => {
+ const okFetch = async (url, init) => {
+  assert.match(url, /models\/gemini-4-hydrogen$/);
+  assert.equal(init.headers['x-goog-api-key'], 'AIzaSyCheck123');
+  return new Response(JSON.stringify({ name: 'models/gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen' }), {
+   status: 200,
+   headers: { 'content-type': 'application/json' }
+  });
+ };
+ const verified = await testGoogleConnection({ apiKey: 'AIzaSyCheck123', model: 'gemini-4-hydrogen' }, { fetcher: okFetch });
+ assert.equal(verified.verified, true);
+ assert.equal(verified.model, 'gemini-4-hydrogen');
+
+ const healthRes = await handleApiRoute(new Request('http://127.0.0.1:4174/api/health'), {});
+ const healthJson = await healthRes.json();
+ assert.equal(healthJson.ok, true);
+ assert.equal(healthJson.defaultModel, 'gemini-4-hydrogen');
+ assert.equal(healthJson.thinkingLevel, 'high');
+
+ const cfgRes = await handleApiRoute(new Request('http://127.0.0.1:4174/api/config'), { GEMINI_API_KEY: 'AIzaSySecretEnvKey' });
+ const cfgTxt = await cfgRes.text();
+ assert.equal(cfgTxt.includes('AIzaSySecretEnvKey'), false);
+ assert.equal(JSON.parse(cfgTxt).ai.ready, true);
 });
