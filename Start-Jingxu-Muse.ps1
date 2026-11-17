@@ -52,9 +52,11 @@ function Get-PortOwners([int]$Port) {
     return @($conns | Select-Object -ExpandProperty OwningProcess -Unique)
 }
 
-function Test-HttpReady([string]$Url) {
+function Test-HttpReady([string]$Url, $Headers = $null) {
     try {
-        $resp = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2
+        $splat = @{ UseBasicParsing = $true; Uri = $Url; TimeoutSec = 2 }
+        if ($Headers) { $splat.Headers = $Headers }
+        $resp = Invoke-WebRequest @splat
         return ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400)
     } catch {
         return $false
@@ -94,8 +96,11 @@ function Resolve-MuseLayout([string]$InstallDir, [string]$ExplicitDataDir) {
         dataDir     = [IO.Path]::GetFullPath($dataDir)
         configPath  = $cfgPath
         config      = $cfg
+        museNode    = (Join-Path $InstallDir 'node\node.exe')
+        entryCjs    = (Join-Path $InstallDir 'services\entry.cjs')
         poolExe     = (Join-Path $InstallDir 'pool\MusePool.exe')
         protocolExe = (Join-Path $InstallDir 'protocol\MuseProtocol.exe')
+        licensePort = if ($cfg.ports.license) { [int]$cfg.ports.license } else { 17373 }
         poolPort    = if ($cfg.ports.pool) { [int]$cfg.ports.pool } else { 18610 }
         protocolPort= if ($cfg.ports.protocol) { [int]$cfg.ports.protocol } else { 18611 }
     }
@@ -136,6 +141,8 @@ if ($Action -eq 'Status') {
     }
     Write-Output ("Jingxu 2.0 (127.0.0.1:{0}/api/health): {1}" -f $JingxuPort, (Test-HttpReady ("http://127.0.0.1:{0}/api/health" -f $JingxuPort)))
     if ($layout.available) {
+        $licHeaders = if ($layout.config.serviceKey) { @{ 'x-canvas-service-key' = [string]$layout.config.serviceKey } } else { $null }
+        Write-Output ("MuseLicense (127.0.0.1:{0}/health): {1}" -f $layout.licensePort, (Test-HttpReady ("http://127.0.0.1:{0}/health" -f $layout.licensePort) $licHeaders))
         Write-Output ("MusePool (127.0.0.1:{0}/healthz): {1}" -f $layout.poolPort, (Test-HttpReady ("http://127.0.0.1:{0}/healthz" -f $layout.poolPort)))
         Write-Output ("MuseProtocol (127.0.0.1:{0}/health): {1}" -f $layout.protocolPort, (Test-HttpReady ("http://127.0.0.1:{0}/health" -f $layout.protocolPort)))
     }
@@ -176,12 +183,13 @@ function Start-TrackedProcess([string]$Name, [int]$Port, [string]$Exe, [string]$
     }
 }
 
-# 1. Start MusePool (18610) and MuseProtocol (18611) ONLY (skipping port 3000 so nothing collides)
+# 1. Start MuseLicense (17373), MusePool (18610), and MuseProtocol (18611) (skipping port 3000 so nothing collides)
 if (-not $WithoutMuse -and $layout.available -and (Test-Path -LiteralPath $layout.poolExe) -and (Test-Path -LiteralPath $layout.protocolExe)) {
     $cfg = $layout.config
     $poolHome = Join-Path $layout.dataDir 'pool'
     $protoHome = Join-Path $layout.dataDir 'protocol'
-    New-Item -ItemType Directory -Force -Path $poolHome, $protoHome | Out-Null
+    $licenseHome = Join-Path $layout.dataDir 'license'
+    New-Item -ItemType Directory -Force -Path $poolHome, $protoHome, $licenseHome | Out-Null
 
     $installerCommon = Join-Path $layout.installDir 'scripts\Installer-Common.ps1'
     $env:CANVAS_APP_DIR = $layout.installDir
@@ -196,6 +204,8 @@ if (-not $WithoutMuse -and $layout.available -and (Test-Path -LiteralPath $layou
         } catch {}
     }
     if ($cfg.serviceKey) { $env:CANVAS_SERVICE_KEY = [string]$cfg.serviceKey }
+    $env:MC_LICENSE_DIR = $licenseHome
+    $env:MC_LICENSE_CLIENT_PORT = [string]$layout.licensePort
     $env:MUSE2API_KEY = [string]$cfg.poolKey
     $env:MUSE2API_HOME = $poolHome
     $env:MUSE2API_PROFILE_ROOT = Join-Path $layout.dataDir 'browser-profiles\pool'
@@ -208,6 +218,30 @@ if (-not $WithoutMuse -and $layout.available -and (Test-Path -LiteralPath $layou
     $env:MC_PROTOCOL_DATA = $protoHome
     $env:MC_PROTOCOL_PORT = [string]$layout.protocolPort
     $env:MUSECANVAS_DATA_DIR = $layout.dataDir
+    Remove-Item Env:PORT -ErrorAction SilentlyContinue
+
+    # 1a. Start MuseCanvas companion license service on 17373 so MusePool can confirm license & allow adding accounts
+    if ((Test-Path -LiteralPath $layout.museNode) -and (Test-Path -LiteralPath $layout.entryCjs)) {
+        $licHeaders = if ($cfg.serviceKey) { @{ 'x-canvas-service-key' = [string]$cfg.serviceKey } } else { $null }
+        $licUrl = ("http://127.0.0.1:{0}/health" -f $layout.licensePort)
+        if (Test-HttpReady $licUrl $licHeaders) {
+            Write-Output ("[OK] MuseLicense already listening on 127.0.0.1:{0}" -f $layout.licensePort)
+        } elseif ((Get-PortOwners $layout.licensePort).Count -gt 0) {
+            Write-Warning ("Port {0} is already occupied by another process; skipping MuseLicense start." -f $layout.licensePort)
+        } else {
+            $licArgs = ('"' + $layout.entryCjs + '" license')
+            $rec = Start-TrackedProcess -Name 'muse-license' -Port $layout.licensePort -Exe $layout.museNode -ProcArgs $licArgs -WorkDir $layout.installDir
+            $newRecords = @($newRecords | Where-Object { $_.name -ne 'muse-license' }) + $rec
+            Save-JsonFile -Path $PidFile -Obj $newRecords
+            $licReady = $false
+            for ($i = 0; $i -lt 40; $i++) {
+                if (Test-HttpReady $licUrl $licHeaders) { $licReady = $true; break }
+                Start-Sleep -Milliseconds 300
+            }
+            if ($licReady) { Write-Output ("[Ready] MuseLicense: {0}" -f $licUrl) }
+            else { Write-Warning ("Timed out waiting for MuseLicense at {0}" -f $licUrl) }
+        }
+    }
 
     if (Test-HttpReady ("http://127.0.0.1:{0}/healthz" -f $layout.poolPort)) {
         Write-Output ("[OK] MusePool already listening on 127.0.0.1:{0}" -f $layout.poolPort)
