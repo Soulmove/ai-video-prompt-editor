@@ -101,6 +101,22 @@ import {
  generateNleAIPlan,
  applyNleAIPlan
 } from './nle-ai.mjs';
+import {
+ MUSE_CHANNELS,
+ MUSE_VIDEO_MODELS,
+ MUSE_RATIOS,
+ MUSE_RESOLUTIONS,
+ MUSE_MODES,
+ normalizeMuseConfig,
+ computeVideoSize,
+ clampMuseSeconds,
+ probeMuseService,
+ submitMuseVideoTask,
+ pollMuseVideoTask,
+ cancelMuseVideoTask,
+ recoverMuseVideoTask,
+ isPlayableVideoUrl
+} from './nle-muse.mjs';
 
 const MAX_HISTORY = 60;
 
@@ -170,6 +186,41 @@ const appState = {
   controller: null,
   timer: 0,
   result: null
+ },
+ muse: {
+  config: normalizeMuseConfig({ channel: 'protocol' }),
+  apiKey: '',
+  showKey: false,
+  probing: false,
+  reachable: false,
+  staticHost: typeof location !== 'undefined' && !['127.0.0.1', 'localhost'].includes(location.hostname),
+  models: [],
+  accountCount: null,
+  accountsKnown: false,
+  accountSummary: [],
+  hasLocalInstall: false,
+  poolAdminUrl: 'http://127.0.0.1:18610/admin',
+  statusMsg: '',
+  statusError: false,
+
+  sourceDraftId: 'current',
+  sourceShotIdx: -1,
+  prompt: '',
+  mode: 'text',
+  seconds: 5,
+  ratio: '16:9',
+  resolution: '720p',
+  generateAudio: true,
+  watermark: false,
+  firstFrame: '',
+  lastFrame: '',
+  refImages: [],
+
+  submitting: false,
+  jobs: [],
+  activeJobId: '',
+  manualUrlInput: '',
+  manualTitleInput: ''
  },
 
  playing: false,
@@ -242,7 +293,8 @@ function persistAppPrefs() {
   aiModel: appState.aiConn.model,
   aiThinkingLevel: appState.aiConn.thinkingLevel,
   aiTransport: appState.aiConn.transport,
-  aiBrief: appState.aiBrief
+  aiBrief: appState.aiBrief,
+  museConfig: normalizeMuseConfig(appState.muse.config)
  });
 }
 
@@ -993,6 +1045,420 @@ async function handleRunAIGenerate() {
  }
 }
 
+/* =========================================================
+   BUILT-IN MUSE VIDEO GENERATION STUDIO (HOME)
+========================================================= */
+function museConnBadgeText() {
+ const m = appState.muse;
+ if (m.probing) return '正在探测服务与模型…';
+ if (m.reachable && m.accountsKnown && m.accountCount > 0) {
+  return `服务在线 · 已登录 ${m.accountCount} 个账号`;
+ }
+ if (m.reachable && m.accountsKnown && m.accountCount === 0) {
+  return '服务在线 · 账号池未登录 (0)';
+ }
+ if (m.reachable) return `服务已连通 (${m.models.length} 模型)`;
+ return m.config.channel === 'custom' ? '待填自定义接口' : '待启动 / 待探测本机 Muse';
+}
+
+function museAvailableDrafts() {
+ const list = [];
+ if (appState.project && hasProjectContent(appState.project)) {
+  list.push({ id: 'current', label: `当前工作台工程 · ${appState.project.title || '未命名'}`, proj: appState.project });
+ }
+ for (const d of appState.drafts || []) {
+  if (list.some((x) => x.proj.id === d.id)) continue;
+  list.push({ id: d.id, label: `${d.title || '未命名草稿'} (${projectDuration(d)}s)`, proj: d });
+ }
+ return list;
+}
+
+function importPromptFromMuseSource() {
+ const m = appState.muse;
+ const sources = museAvailableDrafts();
+ const picked = sources.find((x) => x.id === m.sourceDraftId) || sources[0];
+ if (!picked?.proj) {
+  showToast('当前尚无包含片段的草稿，可先创建分镜或直接手写视频提示词');
+  return;
+ }
+ const proj = picked.proj;
+ const vClips = proj.tracks?.video || [];
+ if (m.sourceShotIdx >= 0 && vClips[m.sourceShotIdx]) {
+  const shot = vClips[m.sourceShotIdx];
+  const savedSel = proj.selected;
+  proj.selected = { track: 'video', id: shot.id };
+  m.prompt = compileTimelinePrompt(proj, 'selected', 'zh');
+  proj.selected = savedSel;
+  if (shot.startRefImage || shot.refImage) {
+   m.firstFrame = shot.startRefImage || shot.refImage;
+   if (shot.endRefImage) m.lastFrame = shot.endRefImage;
+   m.mode = 'frames';
+  }
+  const fmt = proj.format;
+  if (['16:9', '9:16', '1:1', '4:3', '3:4'].includes(fmt)) m.ratio = fmt;
+  if (fmt === '2.39:1') m.ratio = '21:9';
+  m.seconds = clampMuseSeconds(shot.duration, m.config.model);
+  showToast(`已导入第 ${m.sourceShotIdx + 1} 镜「${shot.title}」提示词${m.firstFrame ? '及参考图' : ''}`);
+ } else {
+  m.prompt = compileTimelinePrompt(proj, 'concise', 'zh');
+  const fmt = proj.format;
+  if (['16:9', '9:16', '1:1', '4:3', '3:4'].includes(fmt)) m.ratio = fmt;
+  if (fmt === '2.39:1') m.ratio = '21:9';
+  showToast(`已导入工程「${proj.title}」全片精简提示词`);
+ }
+ render();
+}
+
+async function handleProbeMuseService() {
+ const m = appState.muse;
+ if (m.probing) return;
+ m.probing = true;
+ m.statusMsg = '正在检查本机 Muse 端口、模型列表与账号状态（仅只读探测，不消耗额度）…';
+ m.statusError = false;
+ render(true);
+ try {
+  const res = await probeMuseService(m.config, m.apiKey, { staticHost: m.staticHost });
+  m.reachable = Boolean(res.reachable);
+  m.models = Array.isArray(res.models) ? res.models : [];
+  m.accountCount = res.accountCount ?? null;
+  m.accountsKnown = Boolean(res.accountsKnown);
+  m.accountSummary = Array.isArray(res.accountSummary) ? res.accountSummary : [];
+  m.hasLocalInstall = Boolean(res.hasLocalInstall);
+  if (res.poolAdminUrl) m.poolAdminUrl = res.poolAdminUrl;
+  m.statusMsg = res.note || '已读取 Muse 服务状态。';
+  m.statusError = !res.reachable;
+  persistAppPrefs();
+ } catch (err) {
+  m.reachable = false;
+  m.statusMsg = err.message || '探测 Muse 服务失败。';
+  m.statusError = true;
+ } finally {
+  m.probing = false;
+  render(true);
+ }
+}
+
+const musePollTimers = new Map();
+
+function scheduleMusePoll(jobId) {
+ if (musePollTimers.has(jobId)) return;
+ const timer = setInterval(async () => {
+  const job = appState.muse.jobs.find((j) => j.id === jobId);
+  if (!job || ['completed', 'failed', 'cancelled'].includes(job.status)) {
+   clearInterval(timer);
+   musePollTimers.delete(jobId);
+   return;
+  }
+  try {
+   const state = await pollMuseVideoTask(
+    appState.muse.config,
+    appState.muse.apiKey,
+    job.id,
+    { staticHost: appState.muse.staticHost, useProxy: job.useProxy }
+   );
+   job.status = state.status || 'pending';
+   if (state.notice) job.notice = state.notice;
+   if (state.error) job.error = state.error;
+   if (state.playableUrl) job.videoUrl = state.playableUrl;
+   if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+    clearInterval(timer);
+    musePollTimers.delete(jobId);
+    if (job.status === 'completed') {
+     appState.muse.activeJobId = job.id;
+     showToast('Muse 视频生成完成，可在右侧直接播放与下载');
+    } else if (job.status === 'failed') {
+     showToast(`Muse 任务失败：${job.error || '请查看原因'}`);
+    }
+   }
+   render(true);
+  } catch (err) {
+   job.notice = `轮询等待中：${err.message}`;
+  }
+ }, 3000);
+ musePollTimers.set(jobId, timer);
+}
+
+async function handleSubmitMuseVideo() {
+ const m = appState.muse;
+ if (m.submitting) return;
+ if (!String(m.prompt || '').trim()) {
+  showToast('请先输入视频生成提示词，或从现有草稿导入');
+  document.getElementById('musePromptInput')?.focus();
+  return;
+ }
+ if (m.mode === 'frames' && !m.firstFrame && !m.lastFrame) {
+  showToast('首尾帧模式请至少上传一张首帧图片');
+  return;
+ }
+ if (m.mode === 'reference' && !m.refImages.length) {
+  showToast('参考图模式请至少选择一张参考图片');
+  return;
+ }
+
+ m.submitting = true;
+ m.statusError = false;
+ render(true);
+ try {
+  const created = await submitMuseVideoTask(m.config, m.apiKey, {
+   prompt: m.prompt,
+   seconds: m.seconds,
+   ratio: m.ratio,
+   resolution: m.resolution,
+   generateAudio: m.generateAudio,
+   watermark: m.watermark,
+   mode: m.mode,
+   firstFrame: m.firstFrame,
+   lastFrame: m.lastFrame,
+   refImages: m.refImages
+  }, { staticHost: m.staticHost });
+
+  const job = {
+   id: created.id,
+   cancelKey: created.cancelKey,
+   model: created.model,
+   endpoint: created.endpoint,
+   useProxy: created.useProxy,
+   prompt: m.prompt.trim(),
+   size: created.size,
+   seconds: created.seconds,
+   status: 'pending',
+   notice: '已提交至 Muse，正在排队 / 生成中（一般需 1–3 分钟）…',
+   error: '',
+   videoUrl: '',
+   createdAt: Date.now()
+  };
+  m.jobs.unshift(job);
+  m.activeJobId = job.id;
+  scheduleMusePoll(job.id);
+  showToast(`已提交视频任务 ${job.id}`);
+ } catch (err) {
+  m.statusMsg = err.message || '提交视频生成任务失败。';
+  m.statusError = true;
+  showToast(m.statusMsg);
+ } finally {
+  m.submitting = false;
+  render(true);
+ }
+}
+
+function renderHomeMuseVideoStudio() {
+ const m = appState.muse;
+ const cfg = m.config;
+ const sources = museAvailableDrafts();
+ const pickedSource = sources.find((x) => x.id === m.sourceDraftId) || sources[0];
+ const pickedShots = pickedSource?.proj?.tracks?.video || [];
+ const allModels = [...new Set([...MUSE_VIDEO_MODELS.map(([id]) => id), ...(m.models || [])])];
+ const calcSize = computeVideoSize(m.ratio, m.resolution);
+ const activeJob = m.jobs.find((j) => j.id === m.activeJobId) || m.jobs[0] || null;
+ const adminHref = isPlayableVideoUrl(m.poolAdminUrl) ? m.poolAdminUrl : 'http://127.0.0.1:18610/admin';
+
+ return `
+  <div class="home-ai-header">
+   <div>
+    <div style="display:inline-flex;align-items:center;gap:8px;font-size:16px;font-weight:800;">
+     ${uiIcon('video-studio', 'title-svg')}
+     <span>镜序 2.0 · AI 生成视频（内置 Muse 视频引擎）</span>
+     <span class="ai-pill ${m.reachable ? (m.accountCount > 0 ? 'ok' : 'warm') : 'idle'}">${esc(museConnBadgeText())}</span>
+    </div>
+    <div style="font-size:12px;color:var(--text-muted);margin-top:3px;">参考 MuseCanvas 架构接入本机螺旋池（18610）/ 新接口直连（18611）与自定义兼容网关；支持从 2.0 草稿或分镜一键导入提示词与首尾帧出片。</div>
+   </div>
+   <div style="display:flex;gap:7px;flex-wrap:wrap;">
+    <button type="button" class="btn btn-sm" data-action="muse-open-guide">${uiIcon('script-text')}<span>安装与登录教程</span></button>
+    <button type="button" class="btn btn-sm" data-home-tab="home">${uiIcon('home')}<span>返回首页草稿</span></button>
+   </div>
+  </div>
+
+  <div class="home-ai-layout">
+   <div class="home-ai-col">
+    <section class="ai-card">
+     <div class="ai-card-head">
+      <div class="ai-card-title">${uiIcon('key')}<span>Muse 服务通道与账号 / API 预留配置</span></div>
+      <span class="ai-pill ${m.reachable ? 'ok' : 'idle'}">${m.reachable ? '端口可达' : '未验证'}</span>
+     </div>
+     <div class="field-grid">
+      <div class="field full">
+       <label for="museChannelSelect">接入通道（对应 MuseCanvas 老接口 / 新接口 / 自定义 API）</label>
+       <select id="museChannelSelect" class="select" data-muse-cfg="channel">
+        ${MUSE_CHANNELS.map((ch) => `<option value="${esc(ch.id)}"${ch.id === cfg.channel ? ' selected' : ''}>${esc(ch.label)}</option>`).join('')}
+       </select>
+      </div>
+      <div class="field">
+       <label for="museBaseUrlInput">接口地址 (Base URL)</label>
+       <input id="museBaseUrlInput" class="input" data-muse-cfg="baseUrl" value="${esc(cfg.baseUrl)}" placeholder="http://127.0.0.1:18611/v1" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+       <label for="museModelInput">视频生成模型</label>
+       <input id="museModelInput" class="input" list="museModelList" data-muse-cfg="model" value="${esc(cfg.model)}" placeholder="muse-video" autocomplete="off" spellcheck="false" />
+       <datalist id="museModelList">
+        ${allModels.map((id) => `<option value="${esc(id)}"></option>`).join('')}
+       </datalist>
+      </div>
+      <div class="field">
+       <label for="museAccountLabelInput">预留 Muse 账号标识 / 备注</label>
+       <input id="museAccountLabelInput" class="input" data-muse-cfg="accountLabel" value="${esc(cfg.accountLabel)}" placeholder="如：个人 Muse 主号（账号需在本机池自行登录）" />
+      </div>
+      <div class="field">
+       <label for="museApiKeyInput">API Key / 螺旋池密钥（选填）</label>
+       <div class="ai-key-row">
+        <input id="museApiKeyInput" class="input" type="${m.showKey ? 'text' : 'password'}" data-muse-api-key="1" value="${esc(m.apiKey)}" placeholder="${cfg.useLocalKey && !m.staticHost ? '默认自动使用本机 E:\\MuseCanvasData 密钥' : '粘贴个人 API Key / Pool Key'}" autocomplete="off" spellcheck="false" />
+        <button type="button" class="btn btn-sm" data-action="muse-toggle-key-vis">${uiIcon(m.showKey ? 'eye-off' : 'eye')}</button>
+       </div>
+      </div>
+     </div>
+     <div class="ai-check-pills" style="margin-top:2px;">
+      <label class="ai-check-pill ${cfg.useLocalKey ? 'on' : ''}"><input type="checkbox" data-muse-bool="useLocalKey"${cfg.useLocalKey ? ' checked' : ''} /><span>本地模式优先读取 E:\\MuseCanvasData\\install.json 密钥（不下发前端）</span></label>
+     </div>
+     <div class="ai-btn-row">
+      <button type="button" class="btn btn-sm btn-jy" data-action="muse-probe"${m.probing ? ' disabled' : ''}>${uiIcon('check')}<span>${m.probing ? '正在探测服务…' : '检测连接、模型与账号数'}</span></button>
+      <a class="btn btn-sm" href="${esc(adminHref)}" target="_blank" rel="noopener noreferrer">${uiIcon('character-ref')}<span>打开本机 Muse 账号登录池 (18610/admin)</span></a>
+     </div>
+     ${m.accountsKnown ? `
+      <div class="ai-summary-strip">
+       <span><b>账号池实况：</b>${m.accountCount > 0 ? `已登录 ${m.accountCount} 个账号` : '当前为 0 个已登录账号（需由你本人打开账号登录池完成登录）'}</span>
+       ${m.accountSummary.map((a) => `<span class="ai-summary-chip">${esc(a.label)} · ${esc(a.status)}</span>`).join('')}
+      </div>` : ''}
+     ${m.statusMsg ? `<div class="modal-alert ${m.statusError ? 'error' : 'info'}" style="margin-bottom:0;">${esc(m.statusMsg)}</div>` : ''}
+    </section>
+
+    <section class="ai-card">
+     <div class="ai-card-head">
+      <div class="ai-card-title">${uiIcon('storyboard-track')}<span>视频提示词、草稿导入与生成参数</span></div>
+      <span class="ai-pill idle">目标像素 ${esc(calcSize)} · ${clampMuseSeconds(m.seconds, cfg.model)}s</span>
+     </div>
+
+     <div class="ai-sub-block" style="border-top:none;padding-top:0;">
+      <div class="ai-sub-label">从镜序 2.0 草稿带入分镜提示词（可选）</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+       <select class="select" style="flex:1;min-width:140px;" data-muse-src="draft">
+        ${sources.length ? sources.map((s) => `<option value="${esc(s.id)}"${s.id === m.sourceDraftId ? ' selected' : ''}>${esc(s.label)}</option>`).join('') : '<option value="">当前无已保存片段草稿</option>'}
+       </select>
+       <select class="select" style="flex:1;min-width:120px;" data-muse-src="shot"${pickedShots.length ? '' : ' disabled'}>
+        <option value="-1"${m.sourceShotIdx < 0 ? ' selected' : ''}>整部草稿精简编导提示词</option>
+        ${pickedShots.map((sh, i) => `<option value="${i}"${i === m.sourceShotIdx ? ' selected' : ''}>第 ${i + 1} 镜 · ${esc(sh.title)} (${sh.duration}s)</option>`).join('')}
+       </select>
+       <button type="button" class="btn btn-sm" data-action="muse-load-draft"${sources.length ? '' : ' disabled'}>一键导入提示词</button>
+      </div>
+     </div>
+
+     <div class="field">
+      <label for="musePromptInput">视频生成提示词</label>
+      <textarea id="musePromptInput" class="textarea" rows="4" data-muse-field="prompt" placeholder="描述主体动作、镜头运镜、光影氛围与台词声音；或点击上方一键从 2.0 分镜草稿带入…">${esc(m.prompt)}</textarea>
+     </div>
+
+     <div class="field-grid">
+      <div class="field">
+       <label>生成方式</label>
+       <select class="select" data-muse-field="mode">
+        ${MUSE_MODES.map(([id, lb]) => `<option value="${esc(id)}"${id === m.mode ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+       </select>
+      </div>
+      <div class="field">
+       <label>画幅比例</label>
+       <select class="select" data-muse-field="ratio">
+        ${MUSE_RATIOS.map(([id, lb]) => `<option value="${esc(id)}"${id === m.ratio ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+       </select>
+      </div>
+      <div class="field">
+       <label>输出分辨率</label>
+       <select class="select" data-muse-field="resolution">
+        ${MUSE_RESOLUTIONS.map(([id, lb]) => `<option value="${esc(id)}"${id === m.resolution ? ' selected' : ''}>${esc(lb)}</option>`).join('')}
+       </select>
+      </div>
+      <div class="field">
+       <label>单段时长 (Muse 建议 5–10 秒)</label>
+       <input type="number" min="3" max="30" step="1" class="input" data-muse-num="seconds" value="${m.seconds}" />
+      </div>
+     </div>
+
+     ${m.mode === 'frames' ? `
+      <div class="field-grid" style="padding:8px;background:#111115;border:1px solid var(--border);border-radius:6px;">
+       <div class="field">
+        <label>首帧图片 (first_frame)</label>
+        <input id="museFirstFrameInput" type="file" accept="image/*" class="input" />
+        ${m.firstFrame ? `<div class="ref-thumb-row"><img class="ref-thumb-img" src="${esc(m.firstFrame)}" alt="首帧" /><button type="button" class="btn btn-sm btn-danger" data-action="muse-clear-first">移除</button></div>` : ''}
+       </div>
+       <div class="field">
+        <label>尾帧图片 (last_frame · 选填)</label>
+        <input id="museLastFrameInput" type="file" accept="image/*" class="input" />
+        ${m.lastFrame ? `<div class="ref-thumb-row"><img class="ref-thumb-img" src="${esc(m.lastFrame)}" alt="尾帧" /><button type="button" class="btn btn-sm btn-danger" data-action="muse-clear-last">移除</button></div>` : ''}
+       </div>
+      </div>` : m.mode === 'reference' ? `
+      <div class="field" style="padding:8px;background:#111115;border:1px solid var(--border);border-radius:6px;">
+       <label>参考图片 (image[] 可多选)</label>
+       <input id="museRefImagesInput" type="file" accept="image/*" multiple class="input" />
+       ${m.refImages.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">${m.refImages.map((u, idx) => `<img class="ref-thumb-img" src="${esc(u)}" alt="参考${idx + 1}" />`).join('')}<button type="button" class="btn btn-sm btn-danger" data-action="muse-clear-refs">清空参考图</button></div>` : ''}
+      </div>` : ''}
+
+     <div class="ai-check-pills">
+      <label class="ai-check-pill ${m.generateAudio ? 'on' : ''}"><input type="checkbox" data-muse-opt-bool="generateAudio"${m.generateAudio ? ' checked' : ''} /><span>同时生成原声音频 (generate_audio)</span></label>
+      <label class="ai-check-pill ${m.watermark ? 'on' : ''}"><input type="checkbox" data-muse-opt-bool="watermark"${m.watermark ? ' checked' : ''} /><span>保留平台水印 (watermark)</span></label>
+     </div>
+
+     <div class="ai-btn-row" style="margin-top:6px;">
+      <button type="button" class="btn btn-compile-hero" style="flex:1;justify-content:center;" data-action="muse-submit"${m.submitting ? ' disabled' : ''}>
+       ${uiIcon('video-studio')}
+       <span>${m.submitting ? '正在提交任务至 Muse…' : `提交 Muse 生成视频 (${esc(cfg.model)} · ${esc(calcSize)})`}</span>
+      </button>
+     </div>
+    </section>
+   </div>
+
+   <div class="home-ai-col">
+    <section class="ai-card">
+     <div class="ai-card-head">
+      <div class="ai-card-title">${uiIcon('play')}<span>视频成片预览与下载</span></div>
+      <span class="ai-pill idle">任务列表 (${m.jobs.length})</span>
+     </div>
+     ${activeJob && activeJob.videoUrl && isPlayableVideoUrl(activeJob.videoUrl) ? `
+      <div class="muse-player-wrap">
+       <video controls playsinline preload="metadata" src="${esc(activeJob.videoUrl)}" class="muse-video-player"></video>
+       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap;">
+        <span style="font-size:11.5px;color:var(--text-muted);">${esc(activeJob.model)} · ${esc(activeJob.size)} · ${activeJob.seconds}s</span>
+        <a class="btn btn-sm btn-jy" href="${esc(activeJob.videoUrl)}" download="muse_${esc(activeJob.id)}.mp4">${uiIcon('export')}<span>下载 .mp4 成片</span></a>
+       </div>
+      </div>` : `
+      <div class="muse-player-empty">
+       ${uiIcon('video-studio', 'title-svg')}
+       <div style="font-weight:700;font-size:13px;margin-top:6px;">生成的 MP4 成片将在此直接预览</div>
+       <div style="font-size:11.5px;color:var(--text-dim);margin-top:4px;max-width:340px;">先在左侧检测 Muse 服务并确认账号池已完成登录，点击「提交 Muse 生成视频」后系统将自动轮询进度。</div>
+      </div>`}
+
+     ${m.jobs.length ? `
+      <div class="muse-job-list">
+       ${m.jobs.map((job) => {
+        const badgeCls = job.status === 'completed' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'err' : 'warm';
+        const statusTxt = job.status === 'completed' ? '已成片' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '生成中…';
+        return `
+         <div class="muse-job-card ${job.id === m.activeJobId ? 'active' : ''}">
+          <div class="ai-card-head">
+           <strong style="font-size:12px;">${esc(job.model)} · ${esc(job.size)} · ${job.seconds}s</strong>
+           <span class="ai-pill ${badgeCls}">${statusTxt}</span>
+          </div>
+          <div style="font-size:11px;color:var(--text-muted);margin:4px 0;word-break:break-all;">任务 ID：${esc(job.id)}</div>
+          <div style="font-size:11.5px;color:var(--text-main);">${esc(job.prompt.slice(0, 140))}${job.prompt.length > 140 ? '…' : ''}</div>
+          ${job.error ? `<div style="font-size:11px;color:#fda4af;margin-top:4px;">失败原因：${esc(job.error)}</div>` : job.notice ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">${esc(job.notice)}</div>` : ''}
+          <div class="ai-btn-row" style="margin-top:7px;">
+           ${job.videoUrl ? `<button type="button" class="btn btn-sm btn-jy" data-muse-select-job="${esc(job.id)}">在播放器预览</button>` : ''}
+           ${!['completed', 'cancelled'].includes(job.status) ? `<button type="button" class="btn btn-sm" data-muse-recover-job="${esc(job.id)}">回原对话取回</button>` : ''}
+           ${!['completed', 'failed', 'cancelled'].includes(job.status) ? `<button type="button" class="btn btn-sm btn-danger" data-muse-cancel-job="${esc(job.id)}">停止任务</button>` : ''}
+           <button type="button" class="btn btn-sm" data-muse-del-job="${esc(job.id)}">移除</button>
+          </div>
+         </div>`;
+       }).join('')}
+      </div>` : ''}
+
+     <div class="ai-sub-block" style="margin-top:8px;">
+      <div class="ai-sub-label">手动导入成片视频链接预览（可选）</div>
+      <div style="display:flex;gap:6px;">
+       <input id="museManualUrlInput" class="input" data-muse-manual-url="1" value="${esc(m.manualUrlInput)}" placeholder="粘贴 http(s)://...mp4 或 /api/muse/... 视频地址直接预览" />
+       <button type="button" class="btn btn-sm" data-action="muse-add-manual-video">加载预览</button>
+      </div>
+     </div>
+    </section>
+   </div>
+  </div>`;
+}
+
 function renderHomeScreen() {
  const q = appState.draftFilter.trim().toLowerCase();
  const visibleDrafts = (appState.drafts || []).filter((d) => !q || String(d.title || '').toLowerCase().includes(q));
@@ -1036,6 +1502,8 @@ function renderHomeScreen() {
    </section>`;
  } else if (appState.homeTab === 'ai') {
   mainHtml = renderHomeAIStudio();
+ } else if (appState.homeTab === 'video') {
+  mainHtml = renderHomeMuseVideoStudio();
  } else if (appState.homeTab === 'square') {
   mainHtml = `
    <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -1096,12 +1564,13 @@ function renderHomeScreen() {
      <nav class="home-nav">
       <button class="home-nav-btn ${appState.homeTab === 'home' ? 'active' : ''}" data-home-tab="home">${uiIcon('home')}<span>首页</span></button>
       <button class="home-nav-btn ${appState.homeTab === 'ai' ? 'active' : ''}" data-home-tab="ai">${uiIcon('ai-spark')}<span>AI 辅助生成</span>${isAIApiConfigured() ? '<span class="nav-dot-on" title="API 已配置"></span>' : ''}</button>
+      <button class="home-nav-btn ${appState.homeTab === 'video' ? 'active' : ''}" data-home-tab="video">${uiIcon('video-studio')}<span>AI 生成视频</span>${appState.muse.reachable ? '<span class="nav-dot-on" title="Muse 服务在线"></span>' : ''}</button>
       <button class="home-nav-btn ${appState.homeTab === 'square' ? 'active' : ''}" data-home-tab="square">${uiIcon('gallery')}<span>广场</span></button>
       <button class="home-nav-btn ${appState.homeTab === 'cloud' ? 'active' : ''}" data-home-tab="cloud">${uiIcon('layers')}<span>我的云空间</span></button>
      </nav>
     </div>
     <div class="home-sidebar-foot">
-     <div><span class="status-dot"></span><b>0 AI 依赖 · 内置可选 AI</b></div>
+     <div><span class="status-dot"></span><b>0 AI 依赖 · 内置 AI 与 Muse 视频</b></div>
      <div>免登录 · 数据本地自动存储</div>
     </div>
    </aside>
@@ -2229,6 +2698,27 @@ function renderModal() {
    </div>`;
  }
 
+ if (m.type === 'muse-guide') {
+  return `
+   <div class="modal-backdrop" data-close-modal="1">
+    <div class="modal-box">
+     <div class="modal-head"><span>${uiIcon('video-studio', 'modal-title-svg')}<span>Muse 视频引擎接入与使用教程</span></span><button class="btn btn-sm" data-close-modal="1">${uiIcon('close')}</button></div>
+     <div class="modal-body" style="font-size:12.5px;line-height:1.65;color:var(--text-main);">
+      <div class="modal-alert info">镜序 2.0 借鉴 <code>muse-canvas-deploy (0.23.2)</code> 的双通道架构：支持连接本机 <b>新接口直连（18611）</b>、<b>螺旋池浏览器账号池（18610）</b>，并预留第三方 <code>/v1/videos</code> API 接入。</div>
+      <ol style="padding-left:18px;margin:8px 0 12px;color:var(--text-muted);display:flex;flex-direction:column;gap:6px;">
+       <li><b>第一步 · 启动本地镜序与 Muse 引擎：</b>直接双击项目目录中的 <code>启动镜序2.0与Muse.bat</code>（仅启 4174 + 18610 + 18611，不占 3000 端口，不与桌面其他软件冲突）。也可在关闭 3000 端口冲突后双击桌面 <code>MuseCanvas.lnk</code>。</li>
+       <li><b>第二步 · 本人登录 Muse 账号：</b>点击「打开本机 Muse 账号登录池 (18610/admin)」，用你自己的浏览器账号在螺旋池中完成登录（支持最多 5 个 Muse 账号并跑，两个接口共用同一批账号）。</li>
+       <li><b>第三步 · 回到镜序核对连接：</b>点击「检测连接、模型与账号数」，确认模型列表（如 <code>muse-video</code> / <code>muse-video-协议</code>）且账号数大于 0。若选择自定义远端接口，填入 Base URL 与 API Key 即可。</li>
+       <li><b>第四步 · 导入分镜提示词生成：</b>在左侧选任意 2.0 草稿或单个 V1 分镜，一键导入提示词与首尾帧参考图，设定 5–10 秒、画幅比例与清晰度后提交生成，成片可直接预览并下载 MP4。</li>
+      </ol>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px;">
+       <button class="btn btn-jy" data-close-modal="1">我已了解</button>
+      </div>
+     </div>
+    </div>
+   </div>`;
+ }
+
  return '';
 }
 
@@ -2243,6 +2733,9 @@ function focusDescriptor(el) {
  if (el.dataset?.aiConn) return { sel: `[data-ai-conn="${el.dataset.aiConn}"]` };
  if (el.dataset?.aiBrief) return { sel: `[data-ai-brief="${el.dataset.aiBrief}"]` };
  if (el.dataset?.aiBriefNum) return { sel: `[data-ai-brief-num="${el.dataset.aiBriefNum}"]` };
+ if (el.dataset?.museCfg) return { sel: `[data-muse-cfg="${el.dataset.museCfg}"]` };
+ if (el.dataset?.museField) return { sel: `[data-muse-field="${el.dataset.museField}"]` };
+ if (el.dataset?.museNum) return { sel: `[data-muse-num="${el.dataset.museNum}"]` };
  return null;
 }
 
@@ -2392,6 +2885,41 @@ function bindTransientInputs() {
    }
   });
  }
+
+ const museFirstInput = document.getElementById('museFirstFrameInput');
+ if (museFirstInput) {
+  museFirstInput.addEventListener('change', async (e) => {
+   const file = e.target.files?.[0];
+   if (!file) return;
+   appState.muse.firstFrame = await compressImageToDataUrl(file, 960);
+   render(true);
+   showToast('已载入首帧参考图');
+  });
+ }
+
+ const museLastInput = document.getElementById('museLastFrameInput');
+ if (museLastInput) {
+  museLastInput.addEventListener('change', async (e) => {
+   const file = e.target.files?.[0];
+   if (!file) return;
+   appState.muse.lastFrame = await compressImageToDataUrl(file, 960);
+   render(true);
+   showToast('已载入尾帧参考图');
+  });
+ }
+
+ const museRefsInput = document.getElementById('museRefImagesInput');
+ if (museRefsInput) {
+  museRefsInput.addEventListener('change', async (e) => {
+   const files = Array.from(e.target.files || []).slice(0, 6);
+   if (!files.length) return;
+   const imgs = [];
+   for (const f of files) imgs.push(await compressImageToDataUrl(f, 960));
+   appState.muse.refImages = [...appState.muse.refImages, ...imgs].slice(0, 8);
+   render(true);
+   showToast(`已载入 ${imgs.length} 张参考图片`);
+  });
+ }
 }
 
 function commitCustomNegativeInput() {
@@ -2460,7 +2988,7 @@ function downloadBlob(filename, content, mime = 'text/plain;charset=utf-8') {
    DELEGATED EVENTS
 ========================================================= */
 rootEl.addEventListener('focusin', (e) => {
- if (e.target.closest('[data-ai-conn],[data-ai-brief],[data-ai-brief-num],[data-ai-brief-bool],[data-ai-scope],[data-ai-apply-mode],[data-ai-auto-apply]')) return;
+ if (e.target.closest('[data-ai-conn],[data-ai-brief],[data-ai-brief-num],[data-ai-brief-bool],[data-ai-scope],[data-ai-apply-mode],[data-ai-auto-apply],[data-muse-cfg],[data-muse-api-key],[data-muse-bool],[data-muse-src],[data-muse-field],[data-muse-num],[data-muse-opt-bool],[data-muse-manual-url]')) return;
  if (e.target.closest('input, textarea, select') && !appState.pendingEditSnapshot) {
   appState.pendingEditSnapshot = { label: '参数编辑', project: clone(appState.project) };
  }
@@ -2468,6 +2996,28 @@ rootEl.addEventListener('focusin', (e) => {
 
 rootEl.addEventListener('input', (e) => {
  const el = e.target;
+ if (el.dataset.museApiKey) {
+  appState.muse.apiKey = el.value;
+  return;
+ }
+ if (el.dataset.museManualUrl) {
+  appState.muse.manualUrlInput = el.value;
+  return;
+ }
+ if (el.dataset.museCfg && el.tagName !== 'SELECT') {
+  appState.muse.config[el.dataset.museCfg] = el.value;
+  return;
+ }
+ if (el.dataset.museField && el.tagName !== 'SELECT') {
+  appState.muse[el.dataset.museField] = el.value;
+  return;
+ }
+ if (el.dataset.museNum) {
+  const num = Number(el.value);
+  if (Number.isFinite(num)) appState.muse[el.dataset.museNum] = num;
+  return;
+ }
+
  const aiConnField = el.dataset.aiConn;
  if (aiConnField) {
   if (aiConnField === 'apiKey') {
@@ -2541,6 +3091,56 @@ rootEl.addEventListener('input', (e) => {
 
 rootEl.addEventListener('change', async (e) => {
  const el = e.target;
+ if (el.dataset.museCfg) {
+  const k = el.dataset.museCfg;
+  if (k === 'channel') {
+   const meta = MUSE_CHANNELS.find((c) => c.id === el.value) || MUSE_CHANNELS[0];
+   appState.muse.config = normalizeMuseConfig({
+    ...appState.muse.config,
+    channel: meta.id,
+    baseUrl: meta.baseUrl || (meta.id === 'custom' ? appState.muse.config.baseUrl : ''),
+    model: meta.defaultModel
+   });
+   appState.muse.reachable = false;
+  } else {
+   appState.muse.config = normalizeMuseConfig({ ...appState.muse.config, [k]: el.value });
+  }
+  persistAppPrefs();
+  render(true);
+  return;
+ }
+ if (el.dataset.museBool) {
+  appState.muse.config = normalizeMuseConfig({ ...appState.muse.config, [el.dataset.museBool]: Boolean(el.checked) });
+  persistAppPrefs();
+  render(true);
+  return;
+ }
+ if (el.dataset.museSrc) {
+  if (el.dataset.museSrc === 'draft') {
+   appState.muse.sourceDraftId = el.value;
+   appState.muse.sourceShotIdx = -1;
+  } else {
+   appState.muse.sourceShotIdx = Number(el.value);
+  }
+  render(true);
+  return;
+ }
+ if (el.dataset.museField) {
+  appState.muse[el.dataset.museField] = el.value;
+  if (el.tagName === 'SELECT') render(true);
+  return;
+ }
+ if (el.dataset.museNum) {
+  appState.muse[el.dataset.museNum] = clampMuseSeconds(el.value, appState.muse.config.model);
+  render(true);
+  return;
+ }
+ if (el.dataset.museOptBool) {
+  appState.muse[el.dataset.museOptBool] = Boolean(el.checked);
+  render(true);
+  return;
+ }
+
  if (el.dataset.aiConn) {
   const k = el.dataset.aiConn;
   if (k === 'apiKey') {
@@ -3141,6 +3741,59 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
 
+ const museSelectJob = target.closest('[data-muse-select-job]');
+ if (museSelectJob) {
+  appState.muse.activeJobId = museSelectJob.dataset.museSelectJob;
+  render();
+  return;
+ }
+
+ const museCancelJob = target.closest('[data-muse-cancel-job]');
+ if (museCancelJob) {
+  const jid = museCancelJob.dataset.museCancelJob;
+  const job = appState.muse.jobs.find((j) => j.id === jid);
+  if (job) {
+   await cancelMuseVideoTask(appState.muse.config, appState.muse.apiKey, { cancelKey: job.cancelKey, taskId: job.id }, { staticHost: appState.muse.staticHost });
+   job.status = 'cancelled';
+   job.notice = '已请求停止该任务；若通道为新接口，Muse 原对话可能仍在后台完成。';
+   const tm = musePollTimers.get(jid);
+   if (tm) { clearInterval(tm); musePollTimers.delete(jid); }
+   render();
+   showToast('已停止等待该视频任务');
+  }
+  return;
+ }
+
+ const museRecoverJob = target.closest('[data-muse-recover-job]');
+ if (museRecoverJob) {
+  const jid = museRecoverJob.dataset.museRecoverJob;
+  const job = appState.muse.jobs.find((j) => j.id === jid);
+  if (job) {
+   const ok = await recoverMuseVideoTask(appState.muse.config, appState.muse.apiKey, job.id, { staticHost: appState.muse.staticHost });
+   if (ok) {
+    job.status = 'pending';
+    job.notice = '已发起从原对话取回成片请求，继续轮询结果…';
+    scheduleMusePoll(job.id);
+    render();
+    showToast('已请求取回原对话成品');
+   } else {
+    showToast('当前通道暂未返回可取回的成品');
+   }
+  }
+  return;
+ }
+
+ const museDelJob = target.closest('[data-muse-del-job]');
+ if (museDelJob) {
+  const jid = museDelJob.dataset.museDelJob;
+  const tm = musePollTimers.get(jid);
+  if (tm) { clearInterval(tm); musePollTimers.delete(jid); }
+  appState.muse.jobs = appState.muse.jobs.filter((j) => j.id !== jid);
+  if (appState.muse.activeJobId === jid) appState.muse.activeJobId = appState.muse.jobs[0]?.id || '';
+  render();
+  return;
+ }
+
  const actBtn = target.closest('[data-action]');
  if (!actBtn) return;
  const action = actBtn.dataset.action;
@@ -3428,6 +4081,81 @@ rootEl.addEventListener('click', async (e) => {
  if (action === 'ai-apply-plan') {
   const tgt = actBtn.dataset.target || null;
   await handleApplyAIPlan(tgt);
+  return;
+ }
+
+ // Built-in Muse Video Studio Actions
+ if (action === 'muse-toggle-key-vis') {
+  appState.muse.showKey = !appState.muse.showKey;
+  render(true);
+  return;
+ }
+
+ if (action === 'muse-probe') {
+  await handleProbeMuseService();
+  return;
+ }
+
+ if (action === 'muse-open-guide') {
+  appState.modal = { type: 'muse-guide' };
+  render();
+  return;
+ }
+
+ if (action === 'muse-load-draft') {
+  importPromptFromMuseSource();
+  return;
+ }
+
+ if (action === 'muse-clear-first') {
+  appState.muse.firstFrame = '';
+  render(true);
+  return;
+ }
+
+ if (action === 'muse-clear-last') {
+  appState.muse.lastFrame = '';
+  render(true);
+  return;
+ }
+
+ if (action === 'muse-clear-refs') {
+  appState.muse.refImages = [];
+  render(true);
+  return;
+ }
+
+ if (action === 'muse-submit') {
+  await handleSubmitMuseVideo();
+  return;
+ }
+
+ if (action === 'muse-add-manual-video') {
+  const rawUrl = String(appState.muse.manualUrlInput || '').trim();
+  if (!isPlayableVideoUrl(rawUrl)) {
+   showToast('请输入有效的 http(s)://... 或本地 /api/muse/... 视频地址');
+   return;
+  }
+  const jid = uid('manual_vid');
+  appState.muse.jobs.unshift({
+   id: jid,
+   cancelKey: '',
+   model: 'manual-import',
+   endpoint: '',
+   useProxy: false,
+   prompt: '手动导入预览视频',
+   size: '外部视频',
+   seconds: 0,
+   status: 'completed',
+   notice: '已手动载入本地播放预览',
+   error: '',
+   videoUrl: rawUrl,
+   createdAt: Date.now()
+  });
+  appState.muse.activeJobId = jid;
+  appState.muse.manualUrlInput = '';
+  render();
+  showToast('已载入视频链接到预览播放器');
   return;
  }
 
@@ -3972,6 +4700,7 @@ async function boot() {
   if (prefs.aiThinkingLevel) appState.aiConn.thinkingLevel = String(prefs.aiThinkingLevel);
   if (prefs.aiTransport) appState.aiConn.transport = prefs.aiTransport === 'server' ? 'server' : 'browser';
   if (prefs.aiBrief) appState.aiBrief = normalizeAIBrief(prefs.aiBrief);
+  if (prefs.museConfig) appState.muse.config = normalizeMuseConfig(prefs.museConfig);
  }
  await refreshDraftsCache();
  probeServerConfigIfLocal(false);
