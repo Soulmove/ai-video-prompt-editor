@@ -17,7 +17,7 @@ export const ICON_IDS = new Set([
  'save', 'export', 'settings', 'close', 'check', 'chevron-down',
  'aspect-ratio', 'layers', 'text', 'voiceover', 'image', 'gallery',
  'move', 'select', 'timer',
- 'ai-spark', 'key'
+ 'ai-spark', 'key', 'video-studio'
 ]);
 
 export function uiIcon(name, extraClass = '') {

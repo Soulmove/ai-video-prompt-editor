@@ -3,12 +3,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleApiRoute } from './worker/index.mjs';
+import { handleLocalMuseRoute } from './muse-bridge.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.join(__dirname, 'dist');
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 4174);
 const MAX_API_BYTES = 2 * 1024 * 1024;
+const MAX_MUSE_UPLOAD_BYTES = 32 * 1024 * 1024;
 
 const MIME_TYPES = {
  '.html': 'text/html; charset=utf-8',
@@ -26,30 +28,36 @@ const server = http.createServer(async (req, res) => {
  try {
   const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
   if (url.pathname.startsWith('/api/')) {
+   const limit = url.pathname === '/api/muse/videos' ? MAX_MUSE_UPLOAD_BYTES : MAX_API_BYTES;
    let size = 0;
    const chunks = [];
    for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_API_BYTES) {
+    if (size > limit) {
      res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
      res.end(JSON.stringify({ code: 'PAYLOAD_TOO_LARGE', message: '请求体积超出限制。' }));
      return;
     }
     chunks.push(chunk);
    }
+   const rawBody = Buffer.concat(chunks);
    const headers = new Headers();
    for (const [key, val] of Object.entries(req.headers)) {
-    if (val !== undefined) headers.set(key, Array.isArray(val) ? val.join(',') : val);
+    if (val !== undefined) headers.set(key, Array.isArray(val) ? val.join(','): val);
    }
    const webReq = new Request(url.toString(), {
     method: req.method,
     headers,
-    body: ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks)
+    body: ['GET', 'HEAD'].includes(req.method) ? undefined : rawBody
    });
-   const apiRes = await handleApiRoute(webReq, {
-    GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
-    GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-4-hydrogen'
-   });
+
+   const apiRes = url.pathname.startsWith('/api/muse/')
+    ? await handleLocalMuseRoute(webReq, url, { bodyBuffer: rawBody })
+    : await handleApiRoute(webReq, {
+       GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+       GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-4-hydrogen'
+      });
+
    if (!apiRes) {
     res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ code: 'NOT_FOUND', message: 'API route not found.' }));
@@ -58,7 +66,7 @@ const server = http.createServer(async (req, res) => {
    const outHeaders = {};
    apiRes.headers.forEach((v, k) => { outHeaders[k] = v; });
    res.writeHead(apiRes.status, outHeaders);
-   if (apiRes.body && (outHeaders['content-type'] || '').includes('text/event-stream')) {
+   if (apiRes.body && ((outHeaders['content-type'] || '').includes('text/event-stream') || (outHeaders['content-type'] || '').startsWith('video/'))) {
     const reader = apiRes.body.getReader();
     try {
      while (true) {

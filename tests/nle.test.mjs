@@ -25,6 +25,22 @@ import {
  applyNleAIPlan
 } from '../dist/nle-ai.mjs';
 import { handleApiRoute } from '../worker/index.mjs';
+import { handleLocalMuseRoute } from '../muse-bridge.mjs';
+import {
+ MUSE_CHANNELS,
+ MUSE_VIDEO_MODELS,
+ normalizeMuseConfig,
+ computeVideoSize,
+ clampMuseSeconds,
+ isPlayableVideoUrl,
+ buildMuseVideoFormData,
+ parseMuseTaskState,
+ probeMuseService,
+ submitMuseVideoTask,
+ pollMuseVideoTask,
+ cancelMuseVideoTask,
+ recoverMuseVideoTask
+} from '../dist/nle-muse.mjs';
 
 import {
  createBlankProject,
@@ -271,6 +287,10 @@ test('Lucide linear SVG icon pack covers all UI references and replaces emoji gl
  const modelJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-model.mjs'), 'utf8');
  const aiBriefJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-ai-brief.mjs'), 'utf8');
  const aiJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-ai.mjs'), 'utf8');
+ const museJs = fs.readFileSync(path.join(rootDir, 'dist', 'nle-muse.mjs'), 'utf8');
+ const bridgeJs = fs.readFileSync(path.join(rootDir, 'muse-bridge.mjs'), 'utf8');
+
+ assert.ok(ICON_IDS.has('video-studio'));
 
  for (const id of ICON_IDS) {
   assert.ok(indexHtml.includes(`id="i-${id}"`), `Missing symbol i-${id} in index.html`);
@@ -288,6 +308,8 @@ test('Lucide linear SVG icon pack covers all UI references and replaces emoji gl
  assert.deepEqual(indexHtml.match(emojiRe), null);
  assert.deepEqual(aiBriefJs.match(emojiRe), null);
  assert.deepEqual(aiJs.match(emojiRe), null);
+ assert.deepEqual(museJs.match(emojiRe), null);
+ assert.deepEqual(bridgeJs.match(emojiRe), null);
 });
 
 test('advancePlayhead progresses continuously at 60Hz without zero-quantization stalling', () => {
@@ -604,4 +626,194 @@ test('testGoogleConnection and worker /api/ai routes proxy cleanly without leaki
  const cfgTxt = await cfgRes.text();
  assert.equal(cfgTxt.includes('AIzaSySecretEnvKey'), false);
  assert.equal(JSON.parse(cfgTxt).ai.ready, true);
+});
+
+test('Muse helpers format sizing, duration clamping, FormData fields, and task state safely', async () => {
+ assert.ok(MUSE_CHANNELS.length >= 3);
+ assert.ok(MUSE_VIDEO_MODELS.some(([id]) => id === 'muse-video-协议'));
+
+ assert.equal(computeVideoSize('16:9', '720p'), '1280x720');
+ assert.equal(computeVideoSize('9:16', '720p'), '720x1280');
+ assert.equal(computeVideoSize('1:1', '1080p'), '1088x1088');
+ assert.equal(clampMuseSeconds(1, 'muse-video'), 3);
+ assert.equal(clampMuseSeconds(25, 'muse-video-协议'), 10);
+ assert.equal(clampMuseSeconds(5, 'doubao-video'), 10);
+
+ const norm = normalizeMuseConfig({ channel: 'protocol', baseUrl: 'http://127.0.0.1:18611/', accountLabel: '  主号  ' });
+ assert.equal(norm.channel, 'protocol');
+ assert.equal(norm.baseUrl, 'http://127.0.0.1:18611');
+ assert.equal(norm.accountLabel, '主号');
+ assert.equal(norm.useLocalKey, true);
+
+ assert.equal(isPlayableVideoUrl('javascript:alert(1)'), false);
+ assert.equal(isPlayableVideoUrl('/api/muse/media?endpoint=x&path=%2Fv1%2Fmedia%2Fa.mp4'), true);
+ assert.equal(isPlayableVideoUrl('https://cdn.example.com/out.mp4'), true);
+
+ await assert.rejects(() => buildMuseVideoFormData({ prompt: '   ' }), /请先填写视频生成提示词/);
+
+ const tinyPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+ const framesForm = await buildMuseVideoFormData({
+  model: 'muse-video-协议',
+  prompt: '霓虹雨夜慢推镜头',
+  seconds: 12,
+  ratio: '9:16',
+  resolution: '720p',
+  mode: 'frames',
+  firstFrame: tinyPng,
+  lastFrame: tinyPng
+ });
+ assert.equal(framesForm.seconds, 10);
+ assert.equal(framesForm.size, '720x1280');
+ assert.equal(framesForm.imageCount, 2);
+ assert.ok(framesForm.form.get('first_frame'));
+ assert.ok(framesForm.form.get('last_frame'));
+
+ const refForm = await buildMuseVideoFormData({
+  model: 'muse-video',
+  prompt: '咖啡店走廊长镜头',
+  mode: 'reference',
+  refImages: [tinyPng]
+ });
+ assert.equal(refForm.form.getAll('image[]').length, 1);
+
+ const parsedProxy = parseMuseTaskState(
+  { code: 0, data: { id: 'vid_99', status: 'completed', video_url: '/v1/media/demo.mp4' } },
+  { endpoint: 'http://127.0.0.1:18611/v1', useProxy: true }
+ );
+ assert.equal(parsedProxy.id, 'vid_99');
+ assert.equal(parsedProxy.status, 'completed');
+ assert.equal(
+  parsedProxy.playableUrl,
+  '/api/muse/media?endpoint=http%3A%2F%2F127.0.0.1%3A18611%2Fv1&path=%2Fv1%2Fmedia%2Fdemo.mp4'
+ );
+
+ const parsedFallback = parseMuseTaskState(
+  { id: 'vid_100', status: 'completed' },
+  { endpoint: 'http://127.0.0.1:18610/v1', useProxy: true }
+ );
+ assert.equal(parsedFallback.playableUrl, '/api/muse/videos/vid_100/content?endpoint=http%3A%2F%2F127.0.0.1%3A18610%2Fv1');
+});
+
+test('Muse client direct/remote workflow & loopback-from-HTTPS guard work cleanly', async () => {
+ const prevLoc = globalThis.location;
+ try {
+  globalThis.location = { hostname: 'soulmove.github.io' };
+  await assert.rejects(
+   () => probeMuseService({ channel: 'protocol', baseUrl: 'http://127.0.0.1:18611/v1' }, '', { staticHost: true }),
+   /GitHub Pages HTTPS/
+  );
+ } finally {
+  if (prevLoc === undefined) delete globalThis.location;
+  else globalThis.location = prevLoc;
+ }
+
+ const calls = [];
+ const mockFetch = async (url, init = {}) => {
+  calls.push({ url, method: init.method || 'GET', headers: init.headers });
+  if (url.endsWith('/models')) {
+   return new Response(JSON.stringify({ data: [{ id: 'muse-video-协议' }, { id: 'muse-video' }] }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' }
+   });
+  }
+  if (url.endsWith('/videos')) {
+   return new Response(JSON.stringify({ id: 'task_abc', status: 'queued' }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' }
+   });
+  }
+  if (url.endsWith('/videos/task_abc')) {
+   return new Response(JSON.stringify({ id: 'task_abc', status: 'completed', video_url: 'https://cdn.example.com/ok.mp4' }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' }
+   });
+  }
+  if (url.endsWith('/tasks/cancel') || url.endsWith('/videos/task_abc/recover')) {
+   return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' }
+   });
+  }
+  return new Response('{}', { status: 404 });
+ };
+
+ const remoteCfg = { channel: 'custom', baseUrl: 'https://muse-gw.example.com/v1', model: 'muse-video-协议', transport: 'direct' };
+ const probe = await probeMuseService(remoteCfg, 'sk-remote-999', { fetcher: mockFetch, staticHost: true });
+ assert.equal(probe.reachable, true);
+ assert.deepEqual(probe.models, ['muse-video-协议', 'muse-video']);
+
+ const task = await submitMuseVideoTask(remoteCfg, 'sk-remote-999', { prompt: '清晨街道逆光跑步' }, { fetcher: mockFetch, staticHost: true });
+ assert.equal(task.id, 'task_abc');
+ assert.equal(calls.find((c) => c.url.endsWith('/videos')).headers.Authorization, 'Bearer sk-remote-999');
+
+ const poll = await pollMuseVideoTask(remoteCfg, 'sk-remote-999', 'task_abc', { fetcher: mockFetch, staticHost: true });
+ assert.equal(poll.status, 'completed');
+ assert.equal(poll.playableUrl, 'https://cdn.example.com/ok.mp4');
+
+ assert.equal(await cancelMuseVideoTask(remoteCfg, 'sk-remote-999', { taskId: 'task_abc', cancelKey: 'ck_1' }, { fetcher: mockFetch, staticHost: true }), true);
+ assert.equal(await recoverMuseVideoTask(remoteCfg, 'sk-remote-999', 'task_abc', { fetcher: mockFetch, staticHost: true }), true);
+});
+
+test('muse-bridge handles /api/muse/probe and /api/muse/videos without exposing local poolKey', async () => {
+ const secretKey = 'LOCAL_SECRET_POOL_KEY_DO_NOT_LEAK';
+ const installReader = async () => ({
+  found: true,
+  version: '0.23.2',
+  dataDir: 'E:\\MuseCanvasData',
+  ports: { web: 3000, pool: 18610, protocol: 18611 },
+  poolKey: secretKey
+ });
+
+ const upstreamCalls = [];
+ const mockFetcher = async (url, init = {}) => {
+  upstreamCalls.push({ url, headers: init.headers });
+  if (url === 'http://127.0.0.1:18611/health') {
+   return new Response(JSON.stringify({ ok: true, accounts: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18611/v1/models') {
+   return new Response(JSON.stringify({ data: [{ id: 'muse-video-协议' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/status') {
+   return new Response(JSON.stringify({ accounts: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18611/v1/videos') {
+   return new Response(JSON.stringify({ id: 'task_local_1', debug_token: secretKey }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  return new Response('{}', { status: 404 });
+ };
+
+ const probeReq = new Request('http://127.0.0.1:4174/api/muse/probe', { method: 'POST' });
+ const probeRes = await handleLocalMuseRoute(probeReq, new URL(probeReq.url), {
+  fetcher: mockFetcher,
+  bodyBuffer: Buffer.from(JSON.stringify({ channel: 'protocol', useLocalKey: true })),
+  installReader
+ });
+ const probeText = await probeRes.text();
+ assert.equal(probeRes.status, 200);
+ assert.equal(probeText.includes(secretKey), false);
+ const probeJson = JSON.parse(probeText);
+ assert.equal(probeJson.hasLocalPoolKey, true);
+ assert.equal(probeJson.reachable, true);
+ assert.equal(probeJson.accountsKnown, true);
+ assert.equal(probeJson.accountCount, 0);
+ assert.deepEqual(probeJson.models, ['muse-video-协议']);
+
+ const vidReq = new Request('http://127.0.0.1:4174/api/muse/videos', {
+  method: 'POST',
+  headers: { 'x-muse-channel': 'protocol', 'x-muse-use-local-key': '1', 'content-type': 'multipart/form-data; boundary=x' }
+ });
+ const vidRes = await handleLocalMuseRoute(vidReq, new URL(vidReq.url), {
+  fetcher: mockFetcher,
+  bodyBuffer: Buffer.from('--x--'),
+  installReader
+ });
+ const vidText = await vidRes.text();
+ assert.equal(vidRes.status, 200);
+ assert.equal(vidText.includes(secretKey), false);
+ assert.equal(upstreamCalls.find((c) => c.url.endsWith('/v1/videos')).headers.Authorization, `Bearer ${secretKey}`);
+ assert.equal(upstreamCalls.find((c) => c.url.endsWith('/v1/videos')).headers['x-mc-platform'], 'win32-x64');
+
+ const badMediaReq = new Request('http://127.0.0.1:4174/api/muse/media?path=%2Fv1%2F..%2Fsecret');
+ const badMediaRes = await handleLocalMuseRoute(badMediaReq, new URL(badMediaReq.url), { fetcher: mockFetcher, installReader });
+ assert.equal(badMediaRes.status, 400);
 });

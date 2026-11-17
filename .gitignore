@@ -5,3 +5,4 @@ dist/server/
 .DS_Store
 Thumbs.db
 *.log
+.jingxu-muse-pids.json
