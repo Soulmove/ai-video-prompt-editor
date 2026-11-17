@@ -46,6 +46,7 @@ import {
  importMuseAccountCookies,
  runMuseAccountAction,
  checkMuseProtocolNetwork,
+ fetchMuseRecords,
  formatMuseExpiry
 } from '../dist/nle-muse.mjs';
 
@@ -953,7 +954,75 @@ test('muse-bridge and nle-muse account management routes handle login-window, co
   await runMuseAccountAction({}, '', 'acc_1', 'delete', undefined, { fetcher: localBridgeFetch });
   assert.ok(calls.some((c) => c.url.endsWith('/admin/protocol/sync') && c.headers.Authorization === `Bearer ${secretPoolKey}`));
  } finally {
+   if (prevLoc === undefined) delete globalThis.location;
+   else globalThis.location = prevLoc;
+  }
+});
+
+test('parseMuseTaskState wraps loopback URLs and /api/muse/records syncs completed videos', async () => {
+ const parsedLoop = parseMuseTaskState(
+  { id: 'task_fc9e', status: 'succeeded', url: 'http://127.0.0.1:18611/v1/media/task-fc9e-result.mp4' },
+  { endpoint: 'http://127.0.0.1:18611/v1', useProxy: true }
+ );
+ assert.equal(parsedLoop.status, 'completed');
+ assert.equal(
+  parsedLoop.playableUrl,
+  '/api/muse/media?endpoint=http%3A%2F%2F127.0.0.1%3A18611%2Fv1&path=%2Fv1%2Fmedia%2Ftask-fc9e-result.mp4'
+ );
+
+ const installReader = async () => ({
+  found: true,
+  version: '0.23.2',
+  dataDir: 'E:\\MuseCanvasData',
+  ports: { web: 3000, pool: 18610, protocol: 18611 },
+  poolKey: 'SECRET_KEY'
+ });
+ const mockFetcher = async (url) => {
+  if (url === 'http://127.0.0.1:18611/api/records') {
+   return new Response(JSON.stringify({
+    records: [{
+     ts: '2026-11-17 16:09:34',
+     task: 'task_fc9e',
+     status: 'succeeded',
+     kind: 'text',
+     elapsed_s: 94.2,
+     prompt: '小西瓜变成小男孩',
+     file: 'task-fc9e-result.mp4'
+    }]
+   }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/tasks') {
+   return new Response(JSON.stringify({ tasks: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18611/v1/media/task-fc9e-result.mp4') {
+   return new Response('MP4', { status: 200, headers: { 'content-type': 'video/mp4', 'content-length': '3' } });
+  }
+  return new Response('{}', { status: 404 });
+ };
+
+ const prevLoc = globalThis.location;
+ try {
+  globalThis.location = { hostname: '127.0.0.1' };
+  const localBridgeFetch = async (path, init = {}) => {
+   const fullUrl = new URL(path.replace(/^\.\//, '/'), 'http://127.0.0.1:4174').toString();
+   return await handleLocalMuseRoute(new Request(fullUrl, init), new URL(fullUrl), { fetcher: mockFetcher, installReader });
+  };
+  const recs = await fetchMuseRecords({}, '', { fetcher: localBridgeFetch });
+  assert.equal(recs.records.length, 1);
+  assert.equal(recs.records[0].status, 'completed');
+  assert.equal(
+   recs.records[0].videoUrl,
+   '/api/muse/media?endpoint=http%3A%2F%2F127.0.0.1%3A18611%2Fv1&path=%2Fv1%2Fmedia%2Ftask-fc9e-result.mp4'
+  );
+ } finally {
   if (prevLoc === undefined) delete globalThis.location;
   else globalThis.location = prevLoc;
  }
+
+ const headRes = await handleLocalMuseRoute(
+  new Request('http://127.0.0.1:4174/api/muse/media?endpoint=http%3A%2F%2F127.0.0.1%3A18611%2Fv1&path=%2Fv1%2Fmedia%2Ftask-fc9e-result.mp4', { method: 'HEAD' }),
+  new URL('http://127.0.0.1:4174/api/muse/media?endpoint=http%3A%2F%2F127.0.0.1%3A18611%2Fv1&path=%2Fv1%2Fmedia%2Ftask-fc9e-result.mp4'),
+  { fetcher: mockFetcher, installReader }
+ );
+ assert.equal(headRes.status, 200);
 });

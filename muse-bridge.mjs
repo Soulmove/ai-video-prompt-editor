@@ -234,23 +234,32 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
   if (target.token) authHeaders.Authorization = `Bearer ${target.token}`;
   if (target.isLoopback) authHeaders['x-mc-platform'] = 'win32-x64';
 
-  // Probe target health & models non-destructively (zero generation calls)
+  // Probe target health, models & pool status in parallel (zero generation calls)
   const healthUrl = target.channel === 'pool' ? `${target.originRoot}/healthz` : `${target.originRoot}/health`;
-  try {
-   const hRes = await fetcher(healthUrl, { signal: AbortSignal.timeout(4000) });
-   if (hRes.ok) {
-    out.reachable = true;
-    const hJson = await hRes.json().catch(() => null);
-    if (Array.isArray(hJson?.accounts)) {
-     out.accountsKnown = true;
-     out.accountCount = hJson.accounts.length;
-     out.accountSummary = sanitizeAccountList(hJson.accounts);
-    }
-   }
-  } catch {}
+  const poolPort = localInstall.ports?.pool || 18610;
+  const [healthRes, modelsRes, poolRes] = await Promise.allSettled([
+   fetcher(healthUrl, { signal: AbortSignal.timeout(4000) }),
+   fetcher(`${target.v1Base}/models`, { headers: authHeaders, signal: AbortSignal.timeout(5000) }),
+   target.isLoopback && localInstall.poolKey
+    ? fetcher(`http://127.0.0.1:${poolPort}/admin/status`, {
+       headers: { Authorization: `Bearer ${localInstall.poolKey}` },
+       signal: AbortSignal.timeout(4000)
+      })
+    : Promise.resolve(null)
+  ]);
 
-  try {
-   const mRes = await fetcher(`${target.v1Base}/models`, { headers: authHeaders, signal: AbortSignal.timeout(5000) });
+  if (healthRes.status === 'fulfilled' && healthRes.value?.ok) {
+   out.reachable = true;
+   const hJson = await healthRes.value.json().catch(() => null);
+   if (Array.isArray(hJson?.accounts)) {
+    out.accountsKnown = true;
+    out.accountCount = hJson.accounts.length;
+    out.accountSummary = sanitizeAccountList(hJson.accounts);
+   }
+  }
+
+  if (modelsRes.status === 'fulfilled' && modelsRes.value) {
+   const mRes = modelsRes.value;
    if (mRes.ok) {
     out.reachable = true;
     const mJson = await mRes.json().catch(() => ({}));
@@ -263,31 +272,21 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
      message: 'Muse 服务在线，但授权密钥校验未通过，请核对 Pool Key / API Key。'
     });
    }
-  } catch {}
+  }
 
-  // Check read-only spiral pool account summary if on localhost
-  if (target.isLoopback && localInstall.poolKey) {
-   const poolPort = localInstall.ports?.pool || 18610;
-   try {
-    const pRes = await fetcher(`http://127.0.0.1:${poolPort}/admin/status`, {
-     headers: { Authorization: `Bearer ${localInstall.poolKey}` },
-     signal: AbortSignal.timeout(3000)
-    });
-    if (pRes.ok) {
-     const pJson = await pRes.json().catch(() => null);
-     if (pJson && typeof pJson === 'object') {
-      const accs = pJson.accounts || pJson.pool?.accounts;
-      if (Array.isArray(accs)) {
-       out.accountsKnown = true;
-       out.accountCount = accs.length;
-       out.accountSummary = sanitizeAccountList(accs);
-      } else if (typeof pJson.account_count === 'number') {
-       out.accountsKnown = true;
-       out.accountCount = pJson.account_count;
-      }
-     }
+  if (poolRes.status === 'fulfilled' && poolRes.value?.ok) {
+   const pJson = await poolRes.value.json().catch(() => null);
+   if (pJson && typeof pJson === 'object') {
+    const accs = pJson.accounts || pJson.pool?.accounts;
+    if (Array.isArray(accs)) {
+     out.accountsKnown = true;
+     out.accountCount = accs.length;
+     out.accountSummary = sanitizeAccountList(accs);
+    } else if (typeof pJson.account_count === 'number') {
+     out.accountsKnown = true;
+     out.accountCount = pJson.account_count;
     }
-   } catch {}
+   }
   }
 
   if (!out.reachable) {
@@ -303,8 +302,86 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
   return jsonRes(200, out);
  }
 
- if (url.pathname.startsWith('/api/muse/accounts') || url.pathname === '/api/muse/netcheck') {
+ if (url.pathname.startsWith('/api/muse/accounts') || url.pathname === '/api/muse/netcheck' || url.pathname === '/api/muse/records') {
   const ctx = resolveLocalPoolContext(request.headers, localInstall);
+  if (url.pathname === '/api/muse/records' && request.method === 'GET') {
+   const authHdr = ctx.token ? { Authorization: `Bearer ${ctx.token}` } : {};
+   const protoEndpoint = `${ctx.protocolRoot}/v1`;
+   const poolEndpoint = `${ctx.poolRoot}/v1`;
+   const [protoRes, poolTasksRes] = await Promise.allSettled([
+    fetcher(`${ctx.protocolRoot}/api/records`, { headers: authHdr, signal: AbortSignal.timeout(6000) }),
+    fetcher(`${ctx.poolRoot}/admin/tasks`, { headers: authHdr, signal: AbortSignal.timeout(6000) })
+   ]);
+   const merged = [];
+   const seenIds = new Set();
+
+   if (protoRes.status === 'fulfilled' && protoRes.value?.ok) {
+    const pj = await protoRes.value.json().catch(() => null);
+    for (const r of Array.isArray(pj?.records) ? pj.records : []) {
+     const file = String(r?.file || '');
+     const id = String(r?.task || r?.id || '');
+     const isVid = file.endsWith('.mp4') || file.endsWith('.webm') || String(r?.kind || '').includes('text') || String(r?.kind || '').includes('video') || !file.endsWith('.png');
+     if (!id || !isVid || seenIds.has(id)) continue;
+     seenIds.add(id);
+     const done = r?.status === 'succeeded' || r?.status === 'completed';
+     const videoUrl = done && file
+      ? `/api/muse/media?endpoint=${encodeURIComponent(protoEndpoint)}&path=${encodeURIComponent(`/v1/media/${file}`)}`
+      : '';
+     merged.push({
+      id,
+      source: 'protocol',
+      endpoint: protoEndpoint,
+      useProxy: true,
+      model: 'muse-video-协议',
+      prompt: String(r?.prompt || ''),
+      ts: String(r?.ts || ''),
+      elapsedSec: Number(r?.elapsed_s || 0),
+      status: done ? 'completed' : r?.status === 'failed' ? 'failed' : 'processing',
+      notice: done ? `已完成并保存到本机 (${Math.round(Number(r?.elapsed_s || 0))}s)` : String(r?.error || ''),
+      error: r?.status === 'failed' ? String(r?.error || '生成失败') : '',
+      videoUrl
+     });
+    }
+   }
+
+   if (poolTasksRes.status === 'fulfilled' && poolTasksRes.value?.ok) {
+    const tj = await poolTasksRes.value.json().catch(() => null);
+    for (const t of Array.isArray(tj?.tasks) ? tj.tasks : []) {
+     const id = String(t?.id || t?.task_id || '');
+     if (!id || seenIds.has(id)) continue;
+     const isVid = String(t?.kind || t?.type || '').includes('video') || String(t?.model || '').includes('video');
+     if (!isVid) continue;
+     seenIds.add(id);
+     const done = t?.status === 'succeeded' || t?.status === 'completed';
+     const rawUrl = String(t?.video_url || t?.result_url || t?.url || '');
+     let videoUrl = '';
+     if (done) {
+      if (rawUrl.startsWith('/v1/')) {
+       videoUrl = `/api/muse/media?endpoint=${encodeURIComponent(poolEndpoint)}&path=${encodeURIComponent(rawUrl)}`;
+      } else {
+       videoUrl = `/api/muse/videos/${encodeURIComponent(id)}/content?endpoint=${encodeURIComponent(poolEndpoint)}`;
+      }
+     }
+     merged.push({
+      id,
+      source: 'pool',
+      endpoint: poolEndpoint,
+      useProxy: true,
+      model: String(t?.model || 'muse-video'),
+      prompt: String(t?.prompt || ''),
+      ts: String(t?.created_at || t?.ts || ''),
+      elapsedSec: Number(t?.elapsed || 0),
+      status: done ? 'completed' : t?.status === 'failed' ? 'failed' : 'processing',
+      notice: done ? '已完成并保存到本机螺旋池' : '',
+      error: t?.error ? String(t.error) : '',
+      videoUrl
+     });
+    }
+   }
+
+   merged.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+   return jsonRes(200, { records: merged });
+  }
   if (url.pathname === '/api/muse/netcheck' && request.method === 'GET') {
    try {
     const up = await fetcher(`${ctx.protocolRoot}/api/netcheck${url.search || ''}`, {
@@ -502,7 +579,7 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
  }
 
  const contentMatch = url.pathname.match(/^\/api\/muse\/videos\/([^/]+)\/content$/);
- if (contentMatch && request.method === 'GET') {
+ if (contentMatch && (request.method === 'GET' || request.method === 'HEAD')) {
   try {
    const rangeHdr = request.headers.get('range');
    const hdrsReq = { ...outboundHeaders };
@@ -523,13 +600,13 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
     const v = up.headers.get(k);
     if (v) hdrs[k] = v;
    }
-   return new Response(up.body, { status: up.status, headers: hdrs });
+   return new Response(request.method === 'HEAD' ? null : up.body, { status: up.status, headers: hdrs });
   } catch (err) {
    return jsonRes(502, { code: 'MEDIA_STREAM_ERR', message: scrubSecret(err.message, target.token, 500) });
   }
  }
 
- if (url.pathname === '/api/muse/media' && request.method === 'GET') {
+ if (url.pathname === '/api/muse/media' && (request.method === 'GET' || request.method === 'HEAD')) {
   const relPath = String(url.searchParams.get('path') || '');
   if (!relPath.startsWith('/v1/') || relPath.includes('..')) {
    return jsonRes(400, { code: 'INVALID_MEDIA_PATH', message: '非法的本地媒体路径。' });
@@ -554,7 +631,7 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
     const v = up.headers.get(k);
     if (v) hdrs[k] = v;
    }
-   return new Response(up.body, { status: up.status, headers: hdrs });
+   return new Response(request.method === 'HEAD' ? null : up.body, { status: up.status, headers: hdrs });
   } catch (err) {
    return jsonRes(502, { code: 'MEDIA_PROXY_ERR', message: scrubSecret(err.message, target.token, 500) });
   }

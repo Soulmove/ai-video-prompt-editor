@@ -122,6 +122,7 @@ import {
  importMuseAccountCookies,
  runMuseAccountAction,
  checkMuseProtocolNetwork,
+ fetchMuseRecords,
  formatMuseExpiry
 } from './nle-muse.mjs';
 
@@ -310,6 +311,25 @@ function pushUndo(snapshot = null, label = '编辑操作') {
  appState.future = [];
 }
 
+function sanitizeSavedMuseJobs(jobs) {
+ if (!Array.isArray(jobs)) return [];
+ return jobs.slice(0, 20).map((j) => ({
+  id: String(j?.id || ''),
+  cancelKey: String(j?.cancelKey || ''),
+  model: String(j?.model || 'muse-video'),
+  endpoint: String(j?.endpoint || ''),
+  useProxy: Boolean(j?.useProxy),
+  prompt: String(j?.prompt || '').slice(0, 500),
+  size: String(j?.size || '1280x720'),
+  seconds: Number(j?.seconds || 5),
+  status: String(j?.status || 'pending'),
+  notice: String(j?.notice || ''),
+  error: String(j?.error || ''),
+  videoUrl: isPlayableVideoUrl(j?.videoUrl) ? j.videoUrl : '',
+  createdAt: Number(j?.createdAt || Date.now())
+ })).filter((j) => j.id);
+}
+
 function persistAppPrefs() {
  savePrefs({
   zoom: appState.project.zoom,
@@ -319,7 +339,8 @@ function persistAppPrefs() {
   aiThinkingLevel: appState.aiConn.thinkingLevel,
   aiTransport: appState.aiConn.transport,
   aiBrief: appState.aiBrief,
-  museConfig: normalizeMuseConfig(appState.muse.config)
+  museConfig: normalizeMuseConfig(appState.muse.config),
+  museJobs: sanitizeSavedMuseJobs(appState.muse.jobs)
  });
 }
 
@@ -1343,6 +1364,72 @@ async function handleProbeMuseService() {
  }
 }
 
+function mergeServerMuseRecords(serverRecords) {
+ const m = appState.muse;
+ let changed = false;
+ for (const rec of serverRecords || []) {
+  if (!rec?.id) continue;
+  const existing = m.jobs.find((j) => j.id === rec.id);
+  if (existing) {
+   if (rec.status === 'completed' && existing.status !== 'completed') {
+    existing.status = 'completed';
+    if (rec.videoUrl) existing.videoUrl = rec.videoUrl;
+    if (rec.notice) existing.notice = rec.notice;
+    existing.error = '';
+    changed = true;
+   } else if (rec.videoUrl && !existing.videoUrl) {
+    existing.videoUrl = rec.videoUrl;
+    changed = true;
+   }
+  } else {
+   m.jobs.push({
+    id: rec.id,
+    cancelKey: '',
+    model: rec.model || 'muse-video-协议',
+    endpoint: rec.endpoint || '',
+    useProxy: true,
+    prompt: rec.prompt || '本机已生成 Muse 视频',
+    size: 'MP4',
+    seconds: Math.max(0, Math.round(Number(rec.elapsedSec || 0))),
+    status: rec.status || 'completed',
+    notice: rec.notice || '已从本机 Muse 记录自动同步成片',
+    error: rec.error || '',
+    videoUrl: isPlayableVideoUrl(rec.videoUrl) ? rec.videoUrl : '',
+    createdAt: rec.ts ? (Date.parse(rec.ts.replace(' ', 'T')) || Date.now()) : Date.now()
+   });
+   changed = true;
+  }
+ }
+ m.jobs = m.jobs.slice(0, 30);
+ const curActive = m.jobs.find((j) => j.id === m.activeJobId);
+ if (!curActive?.videoUrl) {
+  const firstDone = m.jobs.find((j) => j.status === 'completed' && isPlayableVideoUrl(j.videoUrl));
+  if (firstDone && firstDone.id !== m.activeJobId) {
+   m.activeJobId = firstDone.id;
+   changed = true;
+  }
+ }
+ if (changed) persistAppPrefs();
+ return changed;
+}
+
+async function refreshMuseServerRecords(silent = false) {
+ const m = appState.muse;
+ if (m.staticHost) return;
+ try {
+  const res = await fetchMuseRecords(m.config, m.apiKey, { staticHost: m.staticHost });
+  const list = Array.isArray(res?.records) ? res.records : [];
+  const changed = mergeServerMuseRecords(list);
+  if (changed) render(true);
+  if (!silent) {
+   const doneCount = list.filter((x) => x.status === 'completed' && x.videoUrl).length;
+   showToast(doneCount ? `已从本机 Muse 同步 ${doneCount} 条已生成视频` : '本机暂无新的已完成视频记录');
+  }
+ } catch (err) {
+  if (!silent) showToast(err.message || '同步本机 Muse 生成记录失败');
+ }
+}
+
 const musePollTimers = new Map();
 
 function scheduleMusePoll(jobId) {
@@ -1355,14 +1442,23 @@ function scheduleMusePoll(jobId) {
    return;
   }
   try {
+   const pollCfg = job.endpoint
+    ? { ...appState.muse.config, baseUrl: job.endpoint, channel: job.endpoint.includes(':18610') ? 'pool' : job.endpoint.includes(':18611') ? 'protocol' : appState.muse.config.channel }
+    : appState.muse.config;
    const state = await pollMuseVideoTask(
-    appState.muse.config,
+    pollCfg,
     appState.muse.apiKey,
     job.id,
     { staticHost: appState.muse.staticHost, useProxy: job.useProxy }
    );
+   const prevStatus = job.status;
    job.status = state.status || 'pending';
-   if (state.notice) job.notice = state.notice;
+   if (state.notice) {
+    job.notice = state.notice;
+   } else if (job.status === 'processing' || job.status === 'pending' || job.status === 'queued') {
+    const waited = Math.max(0, Math.round((Date.now() - Number(job.createdAt || Date.now())) / 1000));
+    job.notice = `Muse 正在生成视频中（已等待 ${waited}s，通常需 60–180s；若网页端已出片可点右上「同步本机已出成片」）…`;
+   }
    if (state.error) job.error = state.error;
    if (state.playableUrl) job.videoUrl = state.playableUrl;
    if (['completed', 'failed', 'cancelled'].includes(job.status)) {
@@ -1375,9 +1471,13 @@ function scheduleMusePoll(jobId) {
      showToast(`Muse 任务失败：${job.error || '请查看原因'}`);
     }
    }
+   if (prevStatus !== job.status || job.status === 'processing' || job.status === 'completed') {
+    persistAppPrefs();
+   }
    render(true);
   } catch (err) {
    job.notice = `轮询等待中：${err.message}`;
+   render(true);
   }
  }, 3000);
  musePollTimers.set(jobId, timer);
@@ -1434,6 +1534,7 @@ async function handleSubmitMuseVideo() {
   };
   m.jobs.unshift(job);
   m.activeJobId = job.id;
+  persistAppPrefs();
   scheduleMusePoll(job.id);
   showToast(`已提交视频任务 ${job.id}`);
  } catch (err) {
@@ -1747,7 +1848,10 @@ function renderHomeMuseVideoStudio() {
     <section class="ai-card">
      <div class="ai-card-head">
       <div class="ai-card-title">${uiIcon('play')}<span>视频成片预览与下载</span></div>
-      <span class="ai-pill idle">任务列表 (${m.jobs.length})</span>
+      <div style="display:flex;gap:6px;align-items:center;">
+       <span class="ai-pill idle">任务列表 (${m.jobs.length})</span>
+       ${!m.staticHost ? `<button type="button" class="btn btn-sm" data-action="muse-refresh-records">${uiIcon('redo')}<span>同步本机已出成片</span></button>` : ''}
+      </div>
      </div>
      ${activeJob && activeJob.videoUrl && isPlayableVideoUrl(activeJob.videoUrl) ? `
       <div class="muse-player-wrap">
@@ -3663,6 +3767,7 @@ rootEl.addEventListener('click', async (e) => {
   render();
   if (appState.homeTab === 'video' && !appState.muse.staticHost && !appState.muse.accountsLoading) {
    refreshMuseAccountPool(true);
+   refreshMuseServerRecords(true);
    if (!appState.muse.netCheck) refreshMuseProtocolNet(false);
   }
   return;
@@ -4145,15 +4250,30 @@ rootEl.addEventListener('click', async (e) => {
   const jid = museRecoverJob.dataset.museRecoverJob;
   const job = appState.muse.jobs.find((j) => j.id === jid);
   if (job) {
-   const ok = await recoverMuseVideoTask(appState.muse.config, appState.muse.apiKey, job.id, { staticHost: appState.muse.staticHost });
-   if (ok) {
-    job.status = 'pending';
-    job.notice = '已发起从原对话取回成片请求，继续轮询结果…';
-    scheduleMusePoll(job.id);
+   const isProto = String(job.endpoint || '').includes(':18611') || (!job.endpoint && appState.muse.config.channel === 'protocol');
+   if (isProto) {
+    try {
+     const state = await pollMuseVideoTask({ ...appState.muse.config, baseUrl: job.endpoint || appState.muse.config.baseUrl }, appState.muse.apiKey, job.id, { staticHost: appState.muse.staticHost, useProxy: job.useProxy });
+     if (state.playableUrl) job.videoUrl = state.playableUrl;
+     job.status = state.status || job.status;
+    } catch {}
+    await refreshMuseServerRecords(true);
+    persistAppPrefs();
     render();
-    showToast('已请求取回原对话成品');
+    showToast(job.status === 'completed' ? '已刷新并取回成片视频' : '已同步本机成片记录；若提交过两次，已完成成片会自动出现在列表中');
    } else {
-    showToast('当前通道暂未返回可取回的成品');
+    const ok = await recoverMuseVideoTask(appState.muse.config, appState.muse.apiKey, job.id, { staticHost: appState.muse.staticHost });
+    if (ok) {
+     job.status = 'pending';
+     job.notice = '已发起从原对话取回成片请求，继续轮询结果…';
+     persistAppPrefs();
+     scheduleMusePoll(job.id);
+     render();
+     showToast('已请求取回原对话成品');
+    } else {
+     await refreshMuseServerRecords(true);
+     showToast('当前通道暂未返回可取回的成品');
+    }
    }
   }
   return;
@@ -4166,6 +4286,7 @@ rootEl.addEventListener('click', async (e) => {
   if (tm) { clearInterval(tm); musePollTimers.delete(jid); }
   appState.muse.jobs = appState.muse.jobs.filter((j) => j.id !== jid);
   if (appState.muse.activeJobId === jid) appState.muse.activeJobId = appState.muse.jobs[0]?.id || '';
+  persistAppPrefs();
   render();
   return;
  }
@@ -4478,6 +4599,11 @@ rootEl.addEventListener('click', async (e) => {
 
  if (action === 'muse-refresh-accounts') {
   await refreshMuseAccountPool(false);
+  return;
+ }
+
+ if (action === 'muse-refresh-records') {
+  await refreshMuseServerRecords(false);
   return;
  }
 
@@ -5108,6 +5234,14 @@ async function boot() {
   if (prefs.aiTransport) appState.aiConn.transport = prefs.aiTransport === 'server' ? 'server' : 'browser';
   if (prefs.aiBrief) appState.aiBrief = normalizeAIBrief(prefs.aiBrief);
   if (prefs.museConfig) appState.muse.config = normalizeMuseConfig(prefs.museConfig);
+  if (Array.isArray(prefs.museJobs)) {
+   appState.muse.jobs = sanitizeSavedMuseJobs(prefs.museJobs);
+   const firstDone = appState.muse.jobs.find((j) => j.status === 'completed' && j.videoUrl) || appState.muse.jobs[0];
+   if (firstDone) appState.muse.activeJobId = firstDone.id;
+   for (const j of appState.muse.jobs) {
+    if (!['completed', 'failed', 'cancelled'].includes(j.status)) scheduleMusePoll(j.id);
+   }
+  }
  }
  await refreshDraftsCache();
  probeServerConfigIfLocal(false);
