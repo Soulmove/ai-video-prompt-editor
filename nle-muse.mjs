@@ -265,7 +265,8 @@ export function unwrapMuseEnvelope(raw, fallbackMsg = 'Muse 返回内容异常�
 export function parseMuseTaskState(raw, { endpoint = '', useProxy = false } = {}) {
  const data = unwrapMuseEnvelope(raw, '未能读取 Muse 视频任务状态。');
  const id = String(data.id || data.task_id || '');
- const status = String(data.status || 'pending').toLowerCase();
+ const rawStatus = String(data.status || 'pending').toLowerCase();
+ const status = rawStatus === 'succeeded' ? 'completed' : rawStatus;
  const notice = String(data.notice || data.progress_message || '');
  const errMsg = typeof data.error === 'string' ? data.error : String(data.error?.message || data.message || '');
  const rawVideoUrl = [
@@ -277,12 +278,22 @@ export function parseMuseTaskState(raw, { endpoint = '', useProxy = false } = {}
  ].find((u) => typeof u === 'string' && u.trim()) || '';
 
  let playableUrl = rawVideoUrl;
- if (rawVideoUrl && rawVideoUrl.startsWith('/') && !rawVideoUrl.startsWith('/api/muse/')) {
-  if (useProxy && endpoint) {
-   playableUrl = `/api/muse/media?endpoint=${encodeURIComponent(endpoint)}&path=${encodeURIComponent(rawVideoUrl)}`;
-  } else if (endpoint) {
-   const root = normalizeMuseBaseUrl(endpoint).replace(/\/(v1|v1beta)$/i, '');
-   playableUrl = `${root}${rawVideoUrl}`;
+ if (rawVideoUrl && !rawVideoUrl.startsWith('/api/muse/')) {
+  if (rawVideoUrl.startsWith('/')) {
+   if (useProxy && endpoint) {
+    playableUrl = `/api/muse/media?endpoint=${encodeURIComponent(endpoint)}&path=${encodeURIComponent(rawVideoUrl)}`;
+   } else if (endpoint) {
+    const root = normalizeMuseBaseUrl(endpoint).replace(/\/(v1|v1beta)$/i, '');
+    playableUrl = `${root}${rawVideoUrl}`;
+   }
+  } else if (useProxy && isLoopbackUrl(rawVideoUrl)) {
+   try {
+    const u = new URL(rawVideoUrl);
+    if (u.pathname.startsWith('/v1/')) {
+     const ep = `${u.origin}/v1`;
+     playableUrl = `/api/muse/media?endpoint=${encodeURIComponent(ep)}&path=${encodeURIComponent(u.pathname)}`;
+    }
+   } catch {}
   }
  }
  if (status === 'completed' && !playableUrl && id && useProxy && endpoint) {
@@ -333,9 +344,12 @@ export async function probeMuseService(rawConfig, apiKey = '', { fetcher = globa
      ...museProxyHeaders(cfg, apiKey)
     },
     body: JSON.stringify({ channel: cfg.channel, baseUrl: cfg.baseUrl, useLocalKey: cfg.useLocalKey }),
-    signal: signal || AbortSignal.timeout(8000)
+    signal: signal || AbortSignal.timeout(15000)
    });
-  } catch {
+  } catch (err) {
+   if (err?.name === 'TimeoutError') {
+    throw new MuseServiceError(504, 'PROBE_TIMEOUT', '本机 Muse 端口探测超时，服务可能正忙于校验或代理握手，请稍后重试。');
+   }
    throw new MuseServiceError(502, 'LOCAL_SERVER_OFFLINE', '无法连接镜序本地后端，请确认通过 node server.mjs 打开工作台。');
   }
   const ct = res.headers.get('content-type') || '';
@@ -397,7 +411,7 @@ export async function submitMuseVideoTask(rawConfig, apiKey = '', params = {}, {
    method: 'POST',
    headers: museProxyHeaders(cfg, apiKey, extraHeaders),
    body: form,
-   signal: signal || AbortSignal.timeout(60000)
+   signal: signal || AbortSignal.timeout(120000)
   });
  } else {
   const v1 = resolveV1Base(cfg.baseUrl);
@@ -408,7 +422,7 @@ export async function submitMuseVideoTask(rawConfig, apiKey = '', params = {}, {
    method: 'POST',
    headers: hdrs,
    body: form,
-   signal: signal || AbortSignal.timeout(60000)
+   signal: signal || AbortSignal.timeout(120000)
   });
  }
 
@@ -605,6 +619,17 @@ export async function checkMuseProtocolNetwork(rawConfig, apiKey = '', force = f
  return await callLocalMuseAdminJson(rawConfig, apiKey, `./api/muse/netcheck${force ? '?force=1' : ''}`, {
   method: 'GET',
   timeoutMs: force ? 35000 : 12000,
+  ...opts
+ });
+}
+
+/**
+ * Fetch completed and recorded local Muse video tasks from 18611 (`/api/records`) & 18610 (`/admin/tasks`).
+ */
+export async function fetchMuseRecords(rawConfig, apiKey = '', opts = {}) {
+ return await callLocalMuseAdminJson(rawConfig, apiKey, './api/muse/records', {
+  method: 'GET',
+  timeoutMs: 10000,
   ...opts
  });
 }
