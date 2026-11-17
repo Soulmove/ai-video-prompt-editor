@@ -1925,6 +1925,97 @@ html, body {
 .muse-job-card.active {
  border-color: var(--jy-teal);
 }
+.muse-net-strip {
+ display: flex;
+ align-items: center;
+ justify-content: space-between;
+ gap: 10px;
+ flex-wrap: wrap;
+ padding: 8px 10px;
+ border-radius: 7px;
+ font-size: 11.5px;
+ line-height: 1.5;
+ border: 1px solid var(--border);
+ background: #101014;
+ color: var(--text-muted);
+}
+.muse-net-strip.ok {
+ border-color: rgba(16, 185, 129, 0.45);
+ background: rgba(16, 185, 129, 0.08);
+ color: #a7f3d0;
+}
+.muse-net-strip.err {
+ border-color: rgba(244, 63, 94, 0.45);
+ background: rgba(244, 63, 94, 0.08);
+ color: #fda4af;
+}
+.muse-add-box {
+ display: flex;
+ flex-direction: column;
+ gap: 6px;
+ padding: 10px 12px;
+ border-radius: 8px;
+ background: #111317;
+ border: 1px solid rgba(16, 185, 129, 0.32);
+}
+.muse-add-box code {
+ background: #0c0d10;
+ border: 1px solid var(--border);
+ padding: 1px 4px;
+ border-radius: 4px;
+ color: #7dd3fc;
+ font-family: var(--font-mono);
+ font-size: 10.5px;
+}
+.muse-btn-green {
+ background: #10b981;
+ border-color: #10b981;
+ color: #041b13;
+ font-weight: 700;
+}
+.muse-btn-green:hover:not(:disabled) {
+ background: #34d399;
+ border-color: #34d399;
+}
+.muse-cookie-details {
+ border: 1px solid var(--border);
+ border-radius: 8px;
+ padding: 8px 10px;
+ background: #101014;
+}
+.muse-cookie-details summary {
+ cursor: pointer;
+ font-size: 12px;
+ font-weight: 600;
+ color: var(--jy-teal);
+ user-select: none;
+}
+.muse-acc-list {
+ display: flex;
+ flex-direction: column;
+ gap: 8px;
+}
+.muse-acc-item {
+ padding: 10px 12px;
+ border-radius: 8px;
+ background: #111216;
+ border: 1px solid var(--border);
+}
+.muse-acc-item.disabled {
+ opacity: 0.65;
+}
+.muse-acc-meta {
+ display: flex;
+ flex-wrap: wrap;
+ gap: 10px;
+ margin-top: 6px;
+ font-size: 11px;
+ color: var(--text-dim);
+}
+.muse-tone-ok { color: #6ee7b7; }
+.muse-tone-warn { color: #fbbf24; }
+.muse-tone-err { color: #fda4af; }
+.muse-tone-idle { color: var(--text-muted); }
 .ai-help-note {
  font-size: 11px;
  line-height: 1.55;
