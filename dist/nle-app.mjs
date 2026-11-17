@@ -115,7 +115,14 @@ import {
  pollMuseVideoTask,
  cancelMuseVideoTask,
  recoverMuseVideoTask,
- isPlayableVideoUrl
+ isPlayableVideoUrl,
+ fetchMuseAccounts,
+ startMuseLoginWindow,
+ pollMuseLoginWindow,
+ importMuseAccountCookies,
+ runMuseAccountAction,
+ checkMuseProtocolNetwork,
+ formatMuseExpiry
 } from './nle-muse.mjs';
 
 const MAX_HISTORY = 60;
@@ -202,6 +209,24 @@ const appState = {
   poolAdminUrl: 'http://127.0.0.1:18610/admin',
   statusMsg: '',
   statusError: false,
+
+  accounts: [],
+  accountStats: null,
+  accountsLoading: false,
+  accountsError: '',
+  netCheck: null,
+  netCheckLoading: false,
+  loginLabelInput: '',
+  loginWindowBusy: false,
+  loginStatusMsg: '',
+  loginStatusTone: 'info',
+  cookieLabelInput: '',
+  cookieInput: '',
+  cookieBoxOpen: false,
+  cookieImporting: false,
+  cookieStatusMsg: '',
+  cookieStatusError: false,
+  accBusyId: '',
 
   sourceDraftId: 'current',
   sourceShotIdx: -1,
@@ -1109,6 +1134,182 @@ function importPromptFromMuseSource() {
  render();
 }
 
+async function refreshMuseAccountPool(silent = false) {
+ const m = appState.muse;
+ if (m.staticHost) return;
+ m.accountsLoading = true;
+ if (!silent) m.accountsError = '';
+ render(true);
+ try {
+  const res = await fetchMuseAccounts(m.config, m.apiKey, { staticHost: m.staticHost });
+  m.accounts = Array.isArray(res.accounts) ? res.accounts : [];
+  m.accountStats = res.stats || null;
+  m.accountsError = '';
+  m.accountsKnown = true;
+  m.accountCount = m.accounts.length;
+  m.accountSummary = m.accounts.map((a) => ({
+   label: a.label,
+   status: a.enabled === false ? '已禁用' : a.ok === true ? '可用' : a.ok === false ? '异常' : '未检测',
+   enabled: a.enabled !== false
+  }));
+  m.reachable = true;
+ } catch (err) {
+  m.accountsError = err.message || '读取本机账号列表失败。';
+ } finally {
+  m.accountsLoading = false;
+  render(true);
+ }
+}
+
+async function refreshMuseProtocolNet(force = false) {
+ const m = appState.muse;
+ if (m.staticHost || m.netCheckLoading) return;
+ m.netCheckLoading = true;
+ render(true);
+ try {
+  const res = await checkMuseProtocolNetwork(m.config, m.apiKey, force, { staticHost: m.staticHost });
+  m.netCheck = res;
+ } catch (err) {
+  m.netCheck = { ok: false, message: err.message || '网络自检未完成。' };
+ } finally {
+  m.netCheckLoading = false;
+  render(true);
+ }
+}
+
+async function handleMuseOpenLoginWindow(accountId = '') {
+ const m = appState.muse;
+ if (m.loginWindowBusy) return;
+ m.loginWindowBusy = true;
+ m.loginStatusTone = 'info';
+ m.loginStatusMsg = accountId
+  ? '正在弹出隔离 Chrome 登录窗口以重新登录该 Muse 账号（请留意桌面与任务栏）…'
+  : '正在启动隔离 Chrome 登录窗口（请留意桌面弹窗或任务栏图标，若 15 秒未见弹窗可改用下方 Cookie 导入）…';
+ render(true);
+ try {
+  const sess = await startMuseLoginWindow(m.config, m.apiKey, {
+   label: accountId ? '' : m.loginLabelInput,
+   accountId
+  }, { staticHost: m.staticHost });
+  const who = accountId ? `「${sess.label || accountId}」` : (m.loginLabelInput ? `「${m.loginLabelInput}」` : 'Muse');
+  m.loginStatusTone = 'warn';
+  m.loginStatusMsg = `已弹出隔离登录窗口！请在弹窗里登录你的 ${who} 账号；登录完成后不要手动关窗，约 10–60 秒自动写入账号池后关窗。`;
+  render(true);
+
+  let misses = 0;
+  while (true) {
+   await new Promise((r) => setTimeout(r, 2500));
+   let cur;
+   try {
+    cur = await pollMuseLoginWindow(m.config, m.apiKey, sess.id, { staticHost: m.staticHost });
+    misses = 0;
+   } catch (err) {
+    if (/没有这个登录窗口/.test(err.message)) {
+     m.loginStatusTone = 'error';
+     m.loginStatusMsg = '本机流量池已重启，当前登录会话中断，请关闭弹窗后重试或改用 Cookie 导入。';
+     break;
+    }
+    if (++misses <= 12) {
+     m.loginStatusMsg = '正在等待本机螺旋池响应（请暂时保持登录弹窗开启）…';
+     render(true);
+     continue;
+    }
+    throw err;
+   }
+   if (cur.status === 'waiting') {
+    if (cur.phase === 'importing') {
+     m.loginStatusTone = 'ok';
+     m.loginStatusMsg = '已检测到登录成功，正在自动采集凭证并同步至新/老接口（请勿关闭窗口）…';
+     render(true);
+    }
+    continue;
+   }
+   if (cur.status === 'done') {
+    m.loginStatusTone = 'ok';
+    m.loginStatusMsg = `${cur.relogin ? '已重新登录' : '已成功添加'}账号「${cur.label || 'Muse'}」并自动加入本机账号池。`;
+    if (!cur.relogin) m.loginLabelInput = '';
+    showToast(m.loginStatusMsg);
+    await refreshMuseAccountPool(true);
+   } else {
+    m.loginStatusTone = 'error';
+    m.loginStatusMsg = cur.error || '未能成功导入该账号，请重试或改用下方 Cookie 粘贴方式。';
+   }
+   break;
+  }
+ } catch (err) {
+  m.loginStatusTone = 'error';
+  m.loginStatusMsg = err.message || '打开登录窗口失败，可先检查 18610 服务或改用下方 Cookie 导入。';
+ } finally {
+  m.loginWindowBusy = false;
+  render(true);
+ }
+}
+
+async function handleMuseImportCookie() {
+ const m = appState.muse;
+ if (m.cookieImporting) return;
+ m.cookieBoxOpen = true;
+ if (!String(m.cookieInput || '').trim()) {
+  m.cookieStatusError = true;
+  m.cookieStatusMsg = '请先粘贴从浏览器复制的 muse.ai Cookie 字符串（需含 hatch_sess 与 hatch_vml）。';
+  render(true);
+  showToast('请先粘贴 Cookie 字符串');
+  return;
+ }
+ m.cookieImporting = true;
+ m.cookieStatusError = false;
+ m.cookieStatusMsg = '正在导入 Cookie 到本机账号池…';
+ render(true);
+ try {
+  const res = await importMuseAccountCookies(m.config, m.apiKey, {
+   label: m.cookieLabelInput,
+   cookieHeader: m.cookieInput
+  }, { staticHost: m.staticHost });
+  m.cookieInput = '';
+  m.cookieLabelInput = '';
+  m.cookieStatusError = Boolean(res.warning);
+  m.cookieStatusMsg = res.warning || `成功导入 ${res.count || 1} 个 Muse 账号！建议对账号点一下「同步新接口」和「校验测试」。`;
+  showToast(res.warning || `成功导入 ${res.count || 1} 个账号`);
+  await refreshMuseAccountPool(true);
+ } catch (err) {
+  m.cookieStatusError = true;
+  m.cookieStatusMsg = err.message || '导入失败，请确认粘贴的是请求标头 cookie: 后的完整内容。';
+ } finally {
+  m.cookieImporting = false;
+  render(true);
+ }
+}
+
+async function handleMuseSingleAccAction(accountId, act, payload = undefined) {
+ const m = appState.muse;
+ if (m.accBusyId) return;
+ m.accBusyId = accountId;
+ render(true);
+ try {
+  const r = await runMuseAccountAction(m.config, m.apiKey, accountId, act, payload, { staticHost: m.staticHost });
+  if (act === 'test') {
+   const qt = r.quota ? `，周已用 ${r.quota.weekly_used_pct ?? '?'}%` : '';
+   showToast(`${r.ok ? '账号可用' : '校验未通过'}：${r.message || ''}${qt}`);
+  } else if (act === 'keepalive') {
+   showToast(r.ok ? '会话保活成功，有效期已刷新' : `保活失败：${r.error || '未知错误'}`);
+  } else if (act === 'quota') {
+   showToast(r.found ? `当前套餐 ${r.plan || 'Muse'} · 周用量已用 ${r.weekly_used_pct ?? '?'}%` : '暂未读到额度详情');
+  } else if (act === 'sync-protocol') {
+   showToast(r.ok ? '已同步登录会话到 18611 新接口' : `同步未完成：${r.error || r.reason || '请先确认账号已登录'}`);
+  } else if (act === 'update') {
+   showToast(payload?.enabled === false ? '已禁用该账号' : '已更新账号设置');
+  } else if (act === 'delete') {
+   showToast('已从本机账号池删除该账号');
+  }
+  await refreshMuseAccountPool(true);
+ } catch (err) {
+  showToast(err.message || '账号操作失败');
+ } finally {
+  m.accBusyId = '';
+  render(true);
+ }
+}
+
 async function handleProbeMuseService() {
  const m = appState.muse;
  if (m.probing) return;
@@ -1127,6 +1328,10 @@ async function handleProbeMuseService() {
   if (res.poolAdminUrl) m.poolAdminUrl = res.poolAdminUrl;
   m.statusMsg = res.note || '已读取 Muse 服务状态。';
   m.statusError = !res.reachable;
+  if (!m.staticHost && m.reachable) {
+   refreshMuseAccountPool(true);
+   refreshMuseProtocolNet(false);
+  }
   persistAppPrefs();
  } catch (err) {
   m.reachable = false;
@@ -1241,6 +1446,140 @@ async function handleSubmitMuseVideo() {
  }
 }
 
+function renderMuseAccountCard(m, adminHref) {
+ const st = m.accountStats || {};
+ const net = m.netCheck;
+ const netTone = !net ? 'idle' : net.ok ? 'ok' : 'err';
+ const netText = m.netCheckLoading
+  ? '正在检测 muse.ai 与 hatch.metaaivm.com 连通性…'
+  : !net
+   ? '尚未执行新接口网络连通性检测'
+   : net.ok
+    ? `新接口网络正常：可连通 muse.ai 与 hatch.metaaivm.com（经 ${esc(net.route || '直连')}）`
+    : `新接口网络异常：${esc(net.message || '无法连接 muse.ai，请确认本机代理已开启')}`;
+
+ if (m.staticHost) {
+  return `
+   <section class="ai-card muse-acc-section">
+    <div class="ai-card-head">
+     <div class="ai-card-title">${uiIcon('character-ref')}<span>本机 Muse 账号配置与账号池（内置管理）</span></div>
+     <span class="ai-pill idle">需本地工作台</span>
+    </div>
+    <div class="modal-alert info" style="margin-bottom:0;">
+     内置 Muse 账号添加与 Cookie 管理需要读取本机 <code>E:\\MuseCanvasData</code> 螺旋池进程（18610）。请双击运行项目根目录 <b>启动镜序2.0与Muse.bat</b> 打开 <code>http://127.0.0.1:4174/</code>，即可直接在镜序页面内弹窗或粘贴 Cookie 添加账号。
+    </div>
+   </section>`;
+ }
+
+ return `
+  <section class="ai-card muse-acc-section">
+   <div class="ai-card-head">
+    <div class="ai-card-title">${uiIcon('character-ref')}<span>本机 Muse 账号配置与账号池（内置管理）</span></div>
+    <div style="display:flex;gap:6px;align-items:center;">
+     <span class="ai-pill ${m.accounts.length ? 'ok' : 'idle'}">已配置 ${m.accounts.length} · 可用 ${st.healthy ?? 0}</span>
+     <button type="button" class="btn btn-sm" data-action="muse-refresh-accounts"${m.accountsLoading ? ' disabled' : ''}>${uiIcon('redo')}<span>${m.accountsLoading ? '刷新中…' : '刷新列表'}</span></button>
+    </div>
+   </div>
+
+   <div class="muse-net-strip ${netTone}">
+    <span style="flex:1;min-width:180px;">${netText}</span>
+    <button type="button" class="btn btn-sm" data-action="muse-netcheck"${m.netCheckLoading ? ' disabled' : ''}>${uiIcon('check')}<span>${m.netCheckLoading ? '检测中…' : '重新检测网络'}</span></button>
+   </div>
+
+   <div class="muse-add-box">
+    <div style="font-size:12px;font-weight:700;color:var(--text-main);">方式 A（推荐）：在镜序内一键弹出独立登录窗口</div>
+    <div style="font-size:11.5px;color:var(--text-muted);line-height:1.55;">
+     原理：本地螺旋池开启一个全新干净的 Chrome 窗口供你正常登录 <code>muse.ai</code>，登录成功后自动抓取 <code>hatch_sess</code> 与 <code>hatch_vml</code> 会话凭证存入 <code>E:\\MuseCanvasData\\pool\\data\\accounts.json</code> 并自动关窗，无需把账号密码给第三方。
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:4px;">
+     <input id="museLoginLabelInput" class="input" style="flex:1;min-width:140px;" data-muse-acc-input="loginLabelInput" value="${esc(m.loginLabelInput)}" placeholder="账号备注名称（选填，如 小号1）" />
+     <button type="button" class="btn btn-sm muse-btn-green" data-action="muse-open-login-window"${m.loginWindowBusy ? ' disabled' : ''}>
+      ${uiIcon('plus')}
+      <span>${m.loginWindowBusy ? '等待弹窗完成登录…' : '添加 Muse 账号（弹出登录窗口）'}</span>
+     </button>
+    </div>
+    ${m.loginStatusMsg ? `<div class="modal-alert ${m.loginStatusTone === 'error' ? 'error' : m.loginStatusTone === 'warn' ? 'warn' : 'info'}" style="margin:6px 0 0;">${esc(m.loginStatusMsg)}</div>` : ''}
+   </div>
+
+   <details class="muse-cookie-details"${m.cookieBoxOpen ? ' open' : ''}>
+    <summary data-action="muse-toggle-cookie-box">方式 B（弹窗慢或未弹出时的快捷兜底）：在自己浏览器登录 muse.ai 后粘贴 Cookie 导入</summary>
+    <div style="padding-top:10px;display:flex;flex-direction:column;gap:8px;">
+     <div class="ai-help-note">
+      <b>取 Cookie 步骤（10 秒完成，避免弹窗等待）：</b><br/>
+      1. 在你平常能上网的浏览器打开并登录 <code>https://muse.ai/</code>；<br/>
+      2. 按 <code>F12</code> 打开开发者工具 → 切到 <b>网络 (Network)</b> → 按 <code>F5</code> 刷新；<br/>
+      3. 点击列表任意一条 <code>muse.ai</code> 请求 → 右侧 <b>标头 (Headers) → 请求标头 (Request Headers)</b>；<br/>
+      4. 找到 <code>cookie:</code> 一行，复制冒号后面的整串内容（必须包含 <code>hatch_sess=</code> 和 <code>hatch_vml=</code>，支持多行批量：<code>标签 | cookie串</code>）。
+     </div>
+     <div class="field-grid">
+      <div class="field" style="grid-column:1 / -1;">
+       <label>账号标签（单条导入选填，批量每行用「标签 | cookie」格式）</label>
+       <input id="museCookieLabelInput" class="input" data-muse-acc-input="cookieLabelInput" value="${esc(m.cookieLabelInput)}" placeholder="如：muse-主号" />
+      </div>
+      <div class="field" style="grid-column:1 / -1;">
+       <label>Cookie 字符串</label>
+       <textarea id="museCookieTextarea" class="textarea" rows="3" data-muse-acc-input="cookieInput" placeholder="粘贴 hatch_sess=...; hatch_vml=...（不会写入工程存档或导出文件）">${esc(m.cookieInput)}</textarea>
+      </div>
+     </div>
+     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <button type="button" class="btn btn-sm btn-jy" data-action="muse-import-cookie"${m.cookieImporting ? ' disabled' : ''}>${uiIcon('import')}<span>${m.cookieImporting ? '正在导入…' : '导入 Cookie 到本机账号池'}</span></button>
+      <a class="btn btn-sm" href="${esc(adminHref)}" target="_blank" rel="noopener noreferrer">${uiIcon('link')}<span>备选：打开原螺旋池网页端</span></a>
+     </div>
+     ${m.cookieStatusMsg ? `<div class="modal-alert ${m.cookieStatusError ? 'error' : 'info'}" style="margin-bottom:0;">${esc(m.cookieStatusMsg)}</div>` : ''}
+    </div>
+   </details>
+
+   ${m.accountsError ? `<div class="modal-alert error" style="margin-bottom:0;">${esc(m.accountsError)}</div>` : ''}
+
+   <div class="muse-acc-list">
+    ${m.accounts.length ? m.accounts.map((acc) => {
+     const busy = m.accBusyId === acc.id;
+     const exp = formatMuseExpiry(acc.expires_at, acc.expires_estimated);
+     const statusPillCls = !acc.enabled ? 'idle' : acc.ok === true ? 'ok' : acc.ok === false ? 'err' : 'warm';
+     const statusLabel = !acc.enabled ? '已禁用' : acc.ok === true ? '可用' : acc.ok === false ? '异常' : '未检测';
+     const whoName = acc.identity?.name || acc.identity?.email || '已采集本地会话';
+     const quotaTxt = acc.quota?.found
+      ? `${acc.quota.plan || 'Muse'} · 周已用 ${acc.quota.weekly_used_pct ?? '?'}%`
+      : '未查额度';
+     return `
+      <div class="muse-acc-item ${!acc.enabled ? 'disabled' : ''}">
+       <div class="ai-card-head" style="gap:8px;flex-wrap:wrap;">
+        <div style="min-width:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+         <strong style="font-size:12.5px;color:var(--text-main);">${esc(acc.label)}</strong>
+         <span style="font-size:11px;color:var(--text-muted);">${esc(whoName)}</span>
+        </div>
+        <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">
+         ${acc.old_ok !== null ? `<span class="ai-pill ${acc.old_ok ? 'ok' : 'err'}">老接口 ${acc.old_ok ? '通' : '断'}</span>` : ''}
+         ${acc.new_ok !== null ? `<span class="ai-pill ${acc.new_ok ? 'ok' : 'warm'}" title="${esc(acc.proto_reason || '')}">新接口 ${acc.new_ok ? '通' : '待同步'}</span>` : ''}
+         <span class="ai-pill ${statusPillCls}">${statusLabel}</span>
+        </div>
+       </div>
+       <div class="muse-acc-meta">
+        <span title="${esc(exp.title)}">有效期：<b class="muse-tone-${exp.level}">${esc(exp.text)}</b></span>
+        <span>Cookie：${acc.cookie_count || 0} 条</span>
+        <span>调用：${acc.use_count || 0} 次</span>
+        <span>额度：${esc(quotaTxt)}</span>
+       </div>
+       ${!acc.essential_ok ? '<div style="font-size:11px;color:#fda4af;margin-top:4px;">缺少核心 Cookie（hatch_sess / hatch_vml），请点重新登录或更新 Cookie。</div>' : ''}
+       ${acc.last_fail_error ? `<div style="font-size:11px;color:#fda4af;margin-top:4px;">最近失败：${esc(acc.last_fail_error)}</div>` : ''}
+       <div class="ai-btn-row" style="margin-top:7px;">
+        <button type="button" class="btn btn-sm" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="test"${busy ? ' disabled' : ''}>校验测试</button>
+        <button type="button" class="btn btn-sm" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="sync-protocol"${busy ? ' disabled' : ''}>同步新接口</button>
+        <button type="button" class="btn btn-sm" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="quota"${busy ? ' disabled' : ''}>查额度</button>
+        <button type="button" class="btn btn-sm" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="keepalive"${busy ? ' disabled' : ''}>会话保活</button>
+        <button type="button" class="btn btn-sm" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="relogin"${busy || m.loginWindowBusy ? ' disabled' : ''}>重新登录</button>
+        <button type="button" class="btn btn-sm" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="toggle" data-muse-acc-next="${acc.enabled ? '0' : '1'}"${busy ? ' disabled' : ''}>${acc.enabled ? '禁用' : '启用'}</button>
+        <button type="button" class="btn btn-sm btn-danger" data-muse-acc-id="${esc(acc.id)}" data-muse-acc-act="delete" data-muse-acc-label="${esc(acc.label)}"${busy ? ' disabled' : ''}>删除</button>
+       </div>
+      </div>`;
+    }).join('') : `
+     <div style="padding:14px;border:1px dashed var(--border);border-radius:8px;text-align:center;font-size:12px;color:var(--text-muted);background:#101014;">
+      当前本机账号池共有 <b>0</b> 个账号。请直接在上方点绿色按钮弹窗登录，或展开「方式 B」粘贴 Cookie 添加你的 Muse 账号。
+     </div>`}
+   </div>
+  </section>`;
+}
+
 function renderHomeMuseVideoStudio() {
  const m = appState.muse;
  const cfg = m.config;
@@ -1300,7 +1639,7 @@ function renderHomeMuseVideoStudio() {
       <div class="field">
        <label for="museApiKeyInput">API Key / 螺旋池密钥（选填）</label>
        <div class="ai-key-row">
-        <input id="museApiKeyInput" class="input" type="${m.showKey ? 'text' : 'password'}" data-muse-api-key="1" value="${esc(m.apiKey)}" placeholder="${cfg.useLocalKey && !m.staticHost ? '默认自动使用本机 E:\\MuseCanvasData 密钥' : '粘贴个人 API Key / Pool Key'}" autocomplete="off" spellcheck="false" />
+        <input id="museApiKeyInput" class="input" type="${m.showKey ? 'text' : 'password'}" data-muse-api-key="1" value="${esc(m.apiKey)}" placeholder="${cfg.useLocalKey && !m.staticHost ? '留空自动读本机密钥' : '粘贴 API Key / Pool Key'}" autocomplete="off" spellcheck="false" />
         <button type="button" class="btn btn-sm" data-action="muse-toggle-key-vis">${uiIcon(m.showKey ? 'eye-off' : 'eye')}</button>
        </div>
       </div>
@@ -1310,15 +1649,16 @@ function renderHomeMuseVideoStudio() {
      </div>
      <div class="ai-btn-row">
       <button type="button" class="btn btn-sm btn-jy" data-action="muse-probe"${m.probing ? ' disabled' : ''}>${uiIcon('check')}<span>${m.probing ? '正在探测服务…' : '检测连接、模型与账号数'}</span></button>
-      <a class="btn btn-sm" href="${esc(adminHref)}" target="_blank" rel="noopener noreferrer">${uiIcon('character-ref')}<span>打开本机 Muse 账号登录池 (18610/admin)</span></a>
      </div>
      ${m.accountsKnown ? `
       <div class="ai-summary-strip">
-       <span><b>账号池实况：</b>${m.accountCount > 0 ? `已登录 ${m.accountCount} 个账号` : '当前为 0 个已登录账号（需由你本人打开账号登录池完成登录）'}</span>
+       <span><b>账号池实况：</b>${m.accountCount > 0 ? `已登录 ${m.accountCount} 个账号` : '当前为 0 个已登录账号（可在下方直接添加你的 Muse 账号）'}</span>
        ${m.accountSummary.map((a) => `<span class="ai-summary-chip">${esc(a.label)} · ${esc(a.status)}</span>`).join('')}
       </div>` : ''}
      ${m.statusMsg ? `<div class="modal-alert ${m.statusError ? 'error' : 'info'}" style="margin-bottom:0;">${esc(m.statusMsg)}</div>` : ''}
     </section>
+
+    ${renderMuseAccountCard(m, adminHref)}
 
     <section class="ai-card">
      <div class="ai-card-head">
@@ -2704,12 +3044,12 @@ function renderModal() {
     <div class="modal-box">
      <div class="modal-head"><span>${uiIcon('video-studio', 'modal-title-svg')}<span>Muse 视频引擎接入与使用教程</span></span><button class="btn btn-sm" data-close-modal="1">${uiIcon('close')}</button></div>
      <div class="modal-body" style="font-size:12.5px;line-height:1.65;color:var(--text-main);">
-      <div class="modal-alert info">镜序 2.0 借鉴 <code>muse-canvas-deploy (0.23.2)</code> 的双通道架构：支持连接本机 <b>新接口直连（18611）</b>、<b>螺旋池浏览器账号池（18610）</b>，并预留第三方 <code>/v1/videos</code> API 接入。</div>
+      <div class="modal-alert info">镜序 2.0 内置接入 <code>MuseCanvas (0.23.2)</code> 双引擎：直接在本页面内即可完成账号配置、模型连接、分镜提示词导入与成片播放。</div>
       <ol style="padding-left:18px;margin:8px 0 12px;color:var(--text-muted);display:flex;flex-direction:column;gap:6px;">
-       <li><b>第一步 · 启动本地镜序与 Muse 引擎：</b>直接双击项目目录中的 <code>启动镜序2.0与Muse.bat</code>（仅启 4174 + 18610 + 18611，不占 3000 端口，不与桌面其他软件冲突）。也可在关闭 3000 端口冲突后双击桌面 <code>MuseCanvas.lnk</code>。</li>
-       <li><b>第二步 · 本人登录 Muse 账号：</b>点击「打开本机 Muse 账号登录池 (18610/admin)」，用你自己的浏览器账号在螺旋池中完成登录（支持最多 5 个 Muse 账号并跑，两个接口共用同一批账号）。</li>
-       <li><b>第三步 · 回到镜序核对连接：</b>点击「检测连接、模型与账号数」，确认模型列表（如 <code>muse-video</code> / <code>muse-video-协议</code>）且账号数大于 0。若选择自定义远端接口，填入 Base URL 与 API Key 即可。</li>
-       <li><b>第四步 · 导入分镜提示词生成：</b>在左侧选任意 2.0 草稿或单个 V1 分镜，一键导入提示词与首尾帧参考图，设定 5–10 秒、画幅比例与清晰度后提交生成，成片可直接预览并下载 MP4。</li>
+       <li><b>原理解析 · Cookie 会话账号池：</b>本机并不保存或上传你的明文密码，而是由本地螺旋池（<code>18610</code>）读取 <code>muse.ai</code> 的 <code>hatch_sess</code>（约 30 天）和 <code>hatch_vml</code>（约 2 天）凭证存入 <code>E:\\MuseCanvasData\\pool\\data\\accounts.json</code>，新接口（<code>18611</code>）与老接口（<code>18610</code>）共用同一份本地账号池。</li>
+       <li><b>第一步 · 启动本地镜序与 Muse 引擎：</b>双击项目目录 <code>启动镜序2.0与Muse.bat</code> 打开 <code>http://127.0.0.1:4174/</code>（绕开 3000 端口，不与桌面软件冲突）。</li>
+       <li><b>第二步 · 直接在镜序内添加账号（二选一）：</b>① 点绿色按钮「添加 Muse 账号（弹出登录窗口）」，在弹出的干净 Chrome 窗口里正常登录 <code>muse.ai</code> 后等待自动抓包关窗（注意窗口可能闪在任务栏里）；② 或在自己浏览器登录 <code>muse.ai</code> 后按 <code>F12 → Network → Headers → cookie:</code> 复制整串粘贴到「方式 B」一秒导入。</li>
+       <li><b>第三步 · 校验并导入分镜生成：</b>在账号列表点「校验测试 / 同步新接口」确认绿标可用后，从下方导入任意 2.0 草稿或单镜提示词即可生成并下载 MP4。</li>
       </ol>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px;">
        <button class="btn btn-jy" data-close-modal="1">我已了解</button>
@@ -2736,6 +3076,7 @@ function focusDescriptor(el) {
  if (el.dataset?.museCfg) return { sel: `[data-muse-cfg="${el.dataset.museCfg}"]` };
  if (el.dataset?.museField) return { sel: `[data-muse-field="${el.dataset.museField}"]` };
  if (el.dataset?.museNum) return { sel: `[data-muse-num="${el.dataset.museNum}"]` };
+ if (el.dataset?.museAccInput) return { sel: `[data-muse-acc-input="${el.dataset.museAccInput}"]` };
  return null;
 }
 
@@ -2988,7 +3329,7 @@ function downloadBlob(filename, content, mime = 'text/plain;charset=utf-8') {
    DELEGATED EVENTS
 ========================================================= */
 rootEl.addEventListener('focusin', (e) => {
- if (e.target.closest('[data-ai-conn],[data-ai-brief],[data-ai-brief-num],[data-ai-brief-bool],[data-ai-scope],[data-ai-apply-mode],[data-ai-auto-apply],[data-muse-cfg],[data-muse-api-key],[data-muse-bool],[data-muse-src],[data-muse-field],[data-muse-num],[data-muse-opt-bool],[data-muse-manual-url]')) return;
+ if (e.target.closest('[data-ai-conn],[data-ai-brief],[data-ai-brief-num],[data-ai-brief-bool],[data-ai-scope],[data-ai-apply-mode],[data-ai-auto-apply],[data-muse-cfg],[data-muse-api-key],[data-muse-bool],[data-muse-src],[data-muse-field],[data-muse-num],[data-muse-opt-bool],[data-muse-manual-url],[data-muse-acc-input]')) return;
  if (e.target.closest('input, textarea, select') && !appState.pendingEditSnapshot) {
   appState.pendingEditSnapshot = { label: '参数编辑', project: clone(appState.project) };
  }
@@ -3002,6 +3343,10 @@ rootEl.addEventListener('input', (e) => {
  }
  if (el.dataset.museManualUrl) {
   appState.muse.manualUrlInput = el.value;
+  return;
+ }
+ if (el.dataset.museAccInput) {
+  appState.muse[el.dataset.museAccInput] = el.value;
   return;
  }
  if (el.dataset.museCfg && el.tagName !== 'SELECT') {
@@ -3316,6 +3661,10 @@ rootEl.addEventListener('click', async (e) => {
   appState.showTrash = false;
   await refreshDraftsCache();
   render();
+  if (appState.homeTab === 'video' && !appState.muse.staticHost && !appState.muse.accountsLoading) {
+   refreshMuseAccountPool(true);
+   if (!appState.muse.netCheck) refreshMuseProtocolNet(false);
+  }
   return;
  }
 
@@ -3741,6 +4090,33 @@ rootEl.addEventListener('click', async (e) => {
   return;
  }
 
+ const museAccActBtn = target.closest('[data-muse-acc-act]');
+ if (museAccActBtn) {
+  const accId = museAccActBtn.dataset.museAccId;
+  const act = museAccActBtn.dataset.museAccAct;
+  if (act === 'relogin') {
+   await handleMuseOpenLoginWindow(accId);
+  } else if (act === 'toggle') {
+   const nextEnabled = museAccActBtn.dataset.museAccNext === '1';
+   await handleMuseSingleAccAction(accId, 'update', { enabled: nextEnabled });
+  } else if (act === 'delete') {
+   const accLabel = museAccActBtn.dataset.museAccLabel || accId;
+   appState.modal = {
+    type: 'confirm',
+    title: '删除 Muse 账号确认',
+    message: `确定从本机账号池删除「${accLabel}」吗？删除后需重新登录或导入 Cookie 才能使用。`,
+    confirmLabel: '确认删除账号',
+    danger: true,
+    confirmKind: 'muse-del-account',
+    accountId: accId
+   };
+   render();
+  } else {
+   await handleMuseSingleAccAction(accId, act);
+  }
+  return;
+ }
+
  const museSelectJob = target.closest('[data-muse-select-job]');
  if (museSelectJob) {
   appState.muse.activeJobId = museSelectJob.dataset.museSelectJob;
@@ -3914,6 +4290,10 @@ rootEl.addEventListener('click', async (e) => {
    await refreshDraftsCache();
    render();
    showToast('已自动保存原草稿，并载入《雨夜巷口》5 轨示范草稿');
+   return;
+  }
+  if (m.confirmKind === 'muse-del-account' && m.accountId) {
+   await handleMuseSingleAccAction(m.accountId, 'delete');
    return;
   }
   render();
@@ -4093,6 +4473,33 @@ rootEl.addEventListener('click', async (e) => {
 
  if (action === 'muse-probe') {
   await handleProbeMuseService();
+  return;
+ }
+
+ if (action === 'muse-refresh-accounts') {
+  await refreshMuseAccountPool(false);
+  return;
+ }
+
+ if (action === 'muse-netcheck') {
+  await refreshMuseProtocolNet(true);
+  return;
+ }
+
+ if (action === 'muse-open-login-window') {
+  await handleMuseOpenLoginWindow('');
+  return;
+ }
+
+ if (action === 'muse-import-cookie') {
+  await handleMuseImportCookie();
+  return;
+ }
+
+ if (action === 'muse-toggle-cookie-box') {
+  e.preventDefault();
+  appState.muse.cookieBoxOpen = !appState.muse.cookieBoxOpen;
+  render(true);
   return;
  }
 

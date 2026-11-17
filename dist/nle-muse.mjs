@@ -508,3 +508,120 @@ export async function recoverMuseVideoTask(rawConfig, apiKey = '', taskId, { fet
  const res = await fetcher(url, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(30000) });
  return res.ok;
 }
+
+async function callLocalMuseAdminJson(rawConfig, apiKey, path, { method = 'GET', body = undefined, timeoutMs = 15000, fetcher = globalThis.fetch, staticHost = false } = {}) {
+ const cfg = normalizeMuseConfig(rawConfig);
+ if (staticHost || !shouldUseLocalProxy(cfg, { staticHost })) {
+  throw new MuseServiceError(400, 'LOCAL_BACKEND_REQUIRED', '内置 Muse 账号添加与管理仅可在本地工作台使用（请运行「启动镜序2.0与Muse.bat」打开 http://127.0.0.1:4174/）。');
+ }
+ const headers = museProxyHeaders(cfg, apiKey);
+ if (body !== undefined) headers['Content-Type'] = 'application/json';
+ let res;
+ try {
+  res = await fetcher(path, {
+   method,
+   headers,
+   body: body !== undefined ? JSON.stringify(body) : undefined,
+   signal: AbortSignal.timeout(timeoutMs)
+  });
+ } catch (err) {
+  throw new MuseServiceError(502, 'LOCAL_SERVER_OFFLINE', `无法连接镜序本地账号桥接服务（${err?.message || '网络异常'}）。`);
+ }
+ const ct = res.headers.get('content-type') || '';
+ if (!ct.includes('application/json')) {
+  throw new MuseServiceError(res.status || 404, 'NO_LOCAL_BACKEND', '未检测到本地 Muse 代理接口，请通过 node server.mjs 打开工作台。');
+ }
+ const data = await res.json().catch(() => ({}));
+ if (!res.ok) {
+  throw new MuseServiceError(res.status, data?.code || 'MUSE_ADMIN_ERR', data?.message || data?.error || data?.detail || `操作失败（HTTP ${res.status}）`);
+ }
+ return data;
+}
+
+/**
+ * List local Muse pool accounts with per-interface status and scrubbed credentials.
+ */
+export async function fetchMuseAccounts(rawConfig, apiKey = '', opts = {}) {
+ return await callLocalMuseAdminJson(rawConfig, apiKey, './api/muse/accounts', { method: 'GET', timeoutMs: 10000, ...opts });
+}
+
+/**
+ * Trigger isolated Chrome login window in local MusePool for zero-copy sign-in.
+ */
+export async function startMuseLoginWindow(rawConfig, apiKey = '', { label = '', accountId = '' } = {}, opts = {}) {
+ const body = accountId ? { account_id: String(accountId).trim() } : { label: String(label || '').trim() };
+ return await callLocalMuseAdminJson(rawConfig, apiKey, './api/muse/accounts/login-window', { method: 'POST', body, timeoutMs: 65000, ...opts });
+}
+
+/**
+ * Poll open MusePool browser login session until cookies are captured or failed.
+ */
+export async function pollMuseLoginWindow(rawConfig, apiKey = '', sessionId, opts = {}) {
+ return await callLocalMuseAdminJson(rawConfig, apiKey, `./api/muse/accounts/login-window/${encodeURIComponent(sessionId)}`, { method: 'GET', timeoutMs: 12000, ...opts });
+}
+
+/**
+ * Import single or batch muse.ai Cookie header strings into local MusePool.
+ */
+export async function importMuseAccountCookies(rawConfig, apiKey = '', { label = '', cookieHeader = '', batch = '' } = {}, opts = {}) {
+ const raw = String(cookieHeader || batch || '').trim();
+ if (!raw) {
+  throw new MuseServiceError(400, 'COOKIE_EMPTY', '请先粘贴 muse.ai 的 Cookie 字符串（至少包含 hatch_sess 与 hatch_vml）。');
+ }
+ return await callLocalMuseAdminJson(rawConfig, apiKey, './api/muse/accounts/import', {
+  method: 'POST',
+  body: { label: String(label || '').trim(), cookie_header: raw },
+  timeoutMs: 25000,
+  ...opts
+ });
+}
+
+/**
+ * Execute single-account maintenance actions (`test`, `keepalive`, `quota`, `sync-protocol`, `update`, `delete`).
+ */
+export async function runMuseAccountAction(rawConfig, apiKey = '', accountId, action, body = undefined, opts = {}) {
+ const id = encodeURIComponent(String(accountId || '').trim());
+ if (!id) throw new MuseServiceError(400, 'INVALID_ACCOUNT_ID', '无效的 Muse 账号 ID。');
+ if (action === 'update') {
+  return await callLocalMuseAdminJson(rawConfig, apiKey, `./api/muse/accounts/${id}`, { method: 'PATCH', body: body || {}, timeoutMs: 15000, ...opts });
+ }
+ if (action === 'delete') {
+  return await callLocalMuseAdminJson(rawConfig, apiKey, `./api/muse/accounts/${id}`, { method: 'DELETE', timeoutMs: 15000, ...opts });
+ }
+ const allowed = new Set(['test', 'keepalive', 'quota', 'sync-protocol', 'cookies']);
+ if (!allowed.has(action)) throw new MuseServiceError(400, 'INVALID_ACTION', '不支持的账号操作。');
+ return await callLocalMuseAdminJson(rawConfig, apiKey, `./api/muse/accounts/${id}/${action}`, {
+  method: 'POST',
+  body,
+  timeoutMs: 45000,
+  ...opts
+ });
+}
+
+/**
+ * Check MuseProtocol (`18611`) network connectivity to `muse.ai` and `hatch.metaaivm.com`.
+ */
+export async function checkMuseProtocolNetwork(rawConfig, apiKey = '', force = false, opts = {}) {
+ return await callLocalMuseAdminJson(rawConfig, apiKey, `./api/muse/netcheck${force ? '?force=1' : ''}`, {
+  method: 'GET',
+  timeoutMs: force ? 35000 : 12000,
+  ...opts
+ });
+}
+
+/**
+ * Format `hatch_vml` cookie expiration timestamp into Chinese status label and tone level.
+ */
+export function formatMuseExpiry(expiresAt, expiresEstimated = false, nowSec = Math.floor(Date.now() / 1000)) {
+ const ts = Number(expiresAt);
+ if (!Number.isFinite(ts) || ts <= 0) return { text: '未记录', level: 'idle', title: '尚未采集到到期时间' };
+ const left = ts - nowSec;
+ const suffix = expiresEstimated ? '（按约 2 天推算）' : '（实测到期）';
+ if (left <= 0) return { text: '已过期，需重新登录', level: 'err', title: `会话已过期${suffix}` };
+ const days = left / 86400;
+ const label = days >= 1
+  ? `剩 ${days >= 10 ? Math.round(days) : days.toFixed(1)} 天`
+  : `剩 ${Math.max(1, Math.floor(left / 3600))} 小时`;
+ const level = days < 1 ? 'err' : days < 3 ? 'warn' : 'ok';
+ return { text: label, level, title: `muse.ai hatch_vml 剩余有效期${suffix}` };
+}

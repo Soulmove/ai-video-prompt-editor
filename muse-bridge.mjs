@@ -91,10 +91,103 @@ function resolveAuthAndTarget(headers, bodyEndpoint = '', localInstall = null) {
 function sanitizeAccountList(rawAccounts) {
  if (!Array.isArray(rawAccounts)) return [];
  return rawAccounts.slice(0, 20).map((a, idx) => ({
-  label: String(a?.name || a?.email || a?.account || a?.id || `账号 ${idx + 1}`).slice(0, 60),
-  status: String(a?.status || (a?.logged_in ? '已登录' : '待验证')),
+  label: String(a?.label || a?.name || a?.email || a?.account || a?.id || `账号 ${idx + 1}`).slice(0, 60),
+  status: String(a?.status || (a?.ok === true ? '可用' : a?.ok === false ? '异常' : '待验证')),
   enabled: a?.enabled !== false
  }));
+}
+
+function scrubAccountRecord(raw = {}, token = '', protoById = null) {
+ const a = raw && typeof raw === 'object' ? raw : {};
+ const id = String(a.id || '');
+ const proto = protoById && id ? protoById[id] : null;
+ return {
+  id,
+  label: String(a.label || a.name || id || '未命名账号').slice(0, 80),
+  enabled: a.enabled !== false,
+  ok: typeof a.ok === 'boolean' ? a.ok : null,
+  essential_ok: a.essential_ok !== false,
+  expires_at: Number.isFinite(Number(a.expires_at)) ? Number(a.expires_at) : null,
+  expires_estimated: Boolean(a.expires_estimated),
+  cookie_count: Number.isFinite(Number(a.cookie_count)) ? Number(a.cookie_count) : 0,
+  use_count: Number.isFinite(Number(a.use_count)) ? Number(a.use_count) : 0,
+  last_used: a.last_used || null,
+  note: scrubSecret(String(a.note || ''), token, 200),
+  duplicate_labels: Array.isArray(a.duplicate_labels) ? a.duplicate_labels.map((s) => String(s)) : [],
+  identity_mismatch: Boolean(a.identity_mismatch),
+  identity: a.identity && typeof a.identity === 'object' ? {
+   name: String(a.identity.name || ''),
+   email: String(a.identity.email || ''),
+   avatar_url: /^https?:\/\//i.test(String(a.identity.avatar_url || '')) ? String(a.identity.avatar_url) : '',
+   vm_id: String(a.identity.vm_id || ''),
+   name_source: String(a.identity.name_source || '')
+  } : null,
+  quota: a.quota && typeof a.quota === 'object' ? {
+   found: Boolean(a.quota.found),
+   plan: String(a.quota.plan || ''),
+   weekly_used_pct: a.quota.weekly_used_pct ?? null,
+   extra_left: a.quota.extra_left ?? null,
+   checked_at: a.quota.checked_at ?? null
+  } : null,
+  today: a.today && typeof a.today === 'object' ? a.today : {},
+  last_fail_error: a.usage?.last_fail_error ? scrubSecret(String(a.usage.last_fail_error), token, 220) : '',
+  old_ok: proto ? Boolean(proto.old_ok) : null,
+  new_ok: proto ? Boolean(proto.new_ok) : null,
+  proto_reason: proto?.reason ? scrubSecret(String(proto.reason), token, 180) : ''
+ };
+}
+
+function resolveLocalPoolContext(headers, localInstall = null) {
+ const poolPort = Number(localInstall?.ports?.pool || 18610);
+ const protocolPort = Number(localInstall?.ports?.protocol || 18611);
+ const rawBase = String(headers.get('x-muse-base-url') || '').trim();
+ const userKey = String(headers.get('x-muse-api-key') || '').trim();
+ const allowLocalKey = headers.get('x-muse-use-local-key') !== '0';
+
+ let poolRoot = `http://127.0.0.1:${poolPort}`;
+ if (rawBase && isLoopbackUrl(rawBase)) {
+  const cleanRoot = resolveV1Base(rawBase).replace(/\/v\d+$/i, '');
+  if (cleanRoot && new URL(cleanRoot).port === String(poolPort)) {
+   poolRoot = cleanRoot;
+  }
+ }
+ const protocolRoot = `http://127.0.0.1:${protocolPort}`;
+ const token = userKey || (allowLocalKey ? String(localInstall?.poolKey || '') : '');
+ return { poolRoot, protocolRoot, token, hasToken: Boolean(token) };
+}
+
+async function forwardPoolAdminJson({ targetUrl, method = 'GET', token = '', jsonBody = undefined, timeoutMs = 15000, fetcher = globalThis.fetch }) {
+ const headers = {};
+ if (token) headers.Authorization = `Bearer ${token}`;
+ if (jsonBody !== undefined) headers['Content-Type'] = 'application/json';
+ try {
+  const up = await fetcher(targetUrl, {
+   method,
+   headers,
+   body: jsonBody !== undefined ? JSON.stringify(jsonBody) : undefined,
+   signal: AbortSignal.timeout(timeoutMs)
+  });
+  const text = await up.text();
+  const scrubbed = scrubSecret(text, token);
+  let parsed = null;
+  try {
+   parsed = scrubbed ? JSON.parse(scrubbed) : {};
+  } catch {
+   parsed = { message: scrubbed || `HTTP ${up.status}` };
+  }
+  if (!up.ok && (up.status === 401 || up.status === 403)) {
+   return jsonRes(400, {
+    code: 'MUSE_POOL_AUTH_FAILED',
+    message: '无法通过本机螺旋池密钥鉴权，请检查 E:\\MuseCanvasData\\install.json 或开启自动密钥选项。'
+   });
+  }
+  return jsonRes(up.status, parsed);
+ } catch (err) {
+  return jsonRes(502, {
+   code: 'MUSE_POOL_UNREACHABLE',
+   message: `连接本机 Muse 账号服务失败（${scrubSecret(err.message, token, 220)}）。请确认已启动本地 Muse 引擎（18610 / 18611）。`
+  });
+ }
 }
 
 export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.fetch, bodyBuffer = null, installReader = readLocalMuseInstallInfo } = {}) {
@@ -208,6 +301,152 @@ export async function handleLocalMuseRoute(request, url, { fetcher = globalThis.
   }
 
   return jsonRes(200, out);
+ }
+
+ if (url.pathname.startsWith('/api/muse/accounts') || url.pathname === '/api/muse/netcheck') {
+  const ctx = resolveLocalPoolContext(request.headers, localInstall);
+  if (url.pathname === '/api/muse/netcheck' && request.method === 'GET') {
+   try {
+    const up = await fetcher(`${ctx.protocolRoot}/api/netcheck${url.search || ''}`, {
+     method: 'GET',
+     signal: AbortSignal.timeout(35000)
+    });
+    const text = await up.text();
+    const cleaned = scrubSecret(text, ctx.token);
+    return new Response(cleaned || '{}', {
+     status: up.status,
+     headers: { 'Content-Type': 'application/json; charset=utf-8' }
+    });
+   } catch (err) {
+    return jsonRes(502, {
+     ok: false,
+     message: `无法连接新接口网检服务 (${ctx.protocolRoot})：${scrubSecret(err.message, ctx.token, 180)}`
+    });
+   }
+  }
+
+  let parsedBody = {};
+  if (bodyBuffer?.length) {
+   try { parsedBody = JSON.parse(bodyBuffer.toString('utf8')); } catch { parsedBody = {}; }
+  }
+
+  if (url.pathname === '/api/muse/accounts' && request.method === 'GET') {
+   const authHdr = ctx.token ? { Authorization: `Bearer ${ctx.token}` } : {};
+   let accRes;
+   try {
+    accRes = await fetcher(`${ctx.poolRoot}/admin/accounts`, { headers: authHdr, signal: AbortSignal.timeout(8000) });
+   } catch (err) {
+    return jsonRes(502, { code: 'MUSE_POOL_OFFLINE', message: `未连接到本机 Muse 螺旋池 (${ctx.poolRoot})：${scrubSecret(err.message, ctx.token, 180)}` });
+   }
+   if (accRes.status === 401 || accRes.status === 403) {
+    return jsonRes(400, { code: 'MUSE_POOL_AUTH_FAILED', message: '本机螺旋池鉴权未通过，请勾选自动使用 install.json 密钥或填正确 Pool Key。' });
+   }
+   const accJson = await accRes.json().catch(() => ({}));
+   let protoConfigured = false;
+   const protoById = {};
+   try {
+    const pRes = await fetcher(`${ctx.poolRoot}/admin/protocol/status`, { headers: authHdr, signal: AbortSignal.timeout(5000) });
+    if (pRes.ok) {
+     const pJson = await pRes.json().catch(() => null);
+     protoConfigured = Boolean(pJson?.configured);
+     for (const item of pJson?.accounts || []) {
+      if (item?.id) protoById[String(item.id)] = item;
+     }
+    }
+   } catch {}
+   const rawList = Array.isArray(accJson?.accounts) ? accJson.accounts : [];
+   return jsonRes(200, {
+    accounts: rawList.map((a) => scrubAccountRecord(a, ctx.token, protoById)),
+    stats: accJson?.stats || {},
+    protocolConfigured: protoConfigured,
+    hasLocalPoolKey: Boolean(localInstall.poolKey)
+   });
+  }
+
+  if (url.pathname === '/api/muse/accounts/import' && request.method === 'POST') {
+   const label = String(parsedBody.label || '').trim().slice(0, 80);
+   const rawCookie = String(parsedBody.cookie_header || parsedBody.batch || '').trim();
+   if (!rawCookie) {
+    return jsonRes(400, { code: 'COOKIE_EMPTY', message: '请先粘贴从 muse.ai 浏览器请求标头中复制的 Cookie 字符串。' });
+   }
+   const lines = rawCookie.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+   const payload = lines.length > 1 ? { batch: lines.join('\n') } : { label, cookie_header: rawCookie };
+   return await forwardPoolAdminJson({
+    targetUrl: `${ctx.poolRoot}/admin/accounts`,
+    method: 'POST',
+    token: ctx.token,
+    jsonBody: payload,
+    timeoutMs: 25000,
+    fetcher
+   });
+  }
+
+  if (url.pathname === '/api/muse/accounts/login-window' && request.method === 'POST') {
+   const payload = parsedBody.account_id
+    ? { account_id: String(parsedBody.account_id).trim() }
+    : { label: String(parsedBody.label || '').trim().slice(0, 80) };
+   return await forwardPoolAdminJson({
+    targetUrl: `${ctx.poolRoot}/admin/login-window`,
+    method: 'POST',
+    token: ctx.token,
+    jsonBody: payload,
+    timeoutMs: 65000,
+    fetcher
+   });
+  }
+
+  const loginSessMatch = url.pathname.match(/^\/api\/muse\/accounts\/login-window\/([^/]+)$/);
+  if (loginSessMatch && request.method === 'GET') {
+   return await forwardPoolAdminJson({
+    targetUrl: `${ctx.poolRoot}/admin/login-window/${loginSessMatch[1]}`,
+    method: 'GET',
+    token: ctx.token,
+    timeoutMs: 12000,
+    fetcher
+   });
+  }
+
+  const accActionMatch = url.pathname.match(/^\/api\/muse\/accounts\/([^/]+)\/(test|keepalive|quota|sync-protocol|cookies)$/);
+  if (accActionMatch && request.method === 'POST') {
+   const [, accId, act] = accActionMatch;
+   if (act === 'sync-protocol') {
+    return await forwardPoolAdminJson({
+     targetUrl: `${ctx.poolRoot}/admin/protocol/sync`,
+     method: 'POST',
+     token: ctx.token,
+     jsonBody: { account_id: decodeURIComponent(accId) },
+     timeoutMs: 25000,
+     fetcher
+    });
+   }
+   const extraBody = act === 'cookies' ? { cookie_header: String(parsedBody.cookie_header || '').trim() } : undefined;
+   if (act === 'cookies' && !extraBody.cookie_header) {
+    return jsonRes(400, { code: 'COOKIE_EMPTY', message: '请提供有效的 Cookie 字符串。' });
+   }
+   return await forwardPoolAdminJson({
+    targetUrl: `${ctx.poolRoot}/admin/accounts/${accId}/${act}`,
+    method: 'POST',
+    token: ctx.token,
+    jsonBody: extraBody,
+    timeoutMs: 45000,
+    fetcher
+   });
+  }
+
+  const accItemMatch = url.pathname.match(/^\/api\/muse\/accounts\/([^/]+)$/);
+  if (accItemMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
+   const accId = accItemMatch[1];
+   return await forwardPoolAdminJson({
+    targetUrl: `${ctx.poolRoot}/admin/accounts/${accId}`,
+    method: request.method,
+    token: ctx.token,
+    jsonBody: request.method === 'PATCH' ? parsedBody : undefined,
+    timeoutMs: 15000,
+    fetcher
+   });
+  }
+
+  return jsonRes(404, { code: 'MUSE_ACCOUNT_ROUTE_NOT_FOUND', message: 'Unknown Muse account management endpoint.' });
  }
 
  let target;

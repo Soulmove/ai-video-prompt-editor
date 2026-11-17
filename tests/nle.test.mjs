@@ -39,7 +39,14 @@ import {
  submitMuseVideoTask,
  pollMuseVideoTask,
  cancelMuseVideoTask,
- recoverMuseVideoTask
+ recoverMuseVideoTask,
+ fetchMuseAccounts,
+ startMuseLoginWindow,
+ pollMuseLoginWindow,
+ importMuseAccountCookies,
+ runMuseAccountAction,
+ checkMuseProtocolNetwork,
+ formatMuseExpiry
 } from '../dist/nle-muse.mjs';
 
 import {
@@ -816,4 +823,137 @@ test('muse-bridge handles /api/muse/probe and /api/muse/videos without exposing 
  const badMediaReq = new Request('http://127.0.0.1:4174/api/muse/media?path=%2Fv1%2F..%2Fsecret');
  const badMediaRes = await handleLocalMuseRoute(badMediaReq, new URL(badMediaReq.url), { fetcher: mockFetcher, installReader });
  assert.equal(badMediaRes.status, 400);
+});
+
+test('muse-bridge and nle-muse account management routes handle login-window, cookies, actions, and netcheck safely', async () => {
+ assert.equal(formatMuseExpiry(null).level, 'idle');
+ assert.equal(formatMuseExpiry(1000, false, 2000).level, 'err');
+ assert.equal(formatMuseExpiry(1000 + 3600 * 30, true, 1000).text, '剩 1.3 天');
+ assert.equal(formatMuseExpiry(1000 + 3600 * 30, true, 1000).level, 'warn');
+
+ const prevLoc = globalThis.location;
+ try {
+  globalThis.location = { hostname: 'soulmove.github.io' };
+  await assert.rejects(() => fetchMuseAccounts({}, '', { staticHost: true }), /LOCAL_BACKEND_REQUIRED|本地工作台/);
+ } finally {
+  if (prevLoc === undefined) delete globalThis.location;
+  else globalThis.location = prevLoc;
+ }
+
+ const secretPoolKey = 'TOP_SECRET_POOL_KEY_888';
+ const installReader = async () => ({
+  found: true,
+  version: '0.23.2',
+  dataDir: 'E:\\MuseCanvasData',
+  ports: { web: 3000, pool: 18610, protocol: 18611 },
+  poolKey: secretPoolKey
+ });
+
+ const calls = [];
+ const mockFetcher = async (url, init = {}) => {
+  calls.push({ url, method: init.method || 'GET', headers: init.headers, body: init.body });
+  if (url === 'http://127.0.0.1:18610/admin/accounts' && (init.method || 'GET') === 'GET') {
+   return new Response(JSON.stringify({
+    accounts: [{
+     id: 'acc_1',
+     label: '测试主号',
+     enabled: true,
+     ok: true,
+     essential_ok: true,
+     cookie_count: 4,
+     cookie_header: 'SHOULD_BE_STRIPPED',
+     expires_at: 2000000000,
+     identity: { name: 'Creator', email: 'creator@example.com' }
+    }],
+    stats: { total: 1, healthy: 1, error: 0, disabled: 0 }
+   }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/protocol/status') {
+   return new Response(JSON.stringify({
+    configured: true,
+    accounts: [{ id: 'acc_1', old_ok: true, new_ok: true }]
+   }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/accounts' && init.method === 'POST') {
+   return new Response(JSON.stringify({ count: 1 }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/login-window' && init.method === 'POST') {
+   return new Response(JSON.stringify({ id: 'lw_1', label: '新小号', status: 'waiting' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/login-window/lw_1') {
+   return new Response(JSON.stringify({ id: 'lw_1', status: 'done', label: '新小号' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/protocol/sync' && init.method === 'POST') {
+   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/accounts/acc_1/test' && init.method === 'POST') {
+   return new Response(JSON.stringify({ ok: true, message: '会话有效' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/accounts/acc_1' && init.method === 'PATCH') {
+   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url === 'http://127.0.0.1:18610/admin/accounts/acc_1' && init.method === 'DELETE') {
+   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.startsWith('http://127.0.0.1:18611/api/netcheck')) {
+   return new Response(JSON.stringify({ ok: true, route: '本机代理端口 7897' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  return new Response('{}', { status: 404 });
+ };
+
+ const accReq = new Request('http://127.0.0.1:4174/api/muse/accounts');
+ const accRes = await handleLocalMuseRoute(accReq, new URL(accReq.url), { fetcher: mockFetcher, installReader });
+ const accText = await accRes.text();
+ assert.equal(accRes.status, 200);
+ assert.equal(accText.includes(secretPoolKey), false);
+ assert.equal(accText.includes('SHOULD_BE_STRIPPED'), false);
+ const accJson = JSON.parse(accText);
+ assert.equal(accJson.accounts.length, 1);
+ assert.equal(accJson.accounts[0].old_ok, true);
+ assert.equal(accJson.accounts[0].new_ok, true);
+
+ const impReq = new Request('http://127.0.0.1:4174/api/muse/accounts/import', { method: 'POST' });
+ const impRes = await handleLocalMuseRoute(impReq, new URL(impReq.url), {
+  fetcher: mockFetcher,
+  bodyBuffer: Buffer.from(JSON.stringify({ label: '测试主号', cookie_header: 'hatch_sess=abc; hatch_vml=xyz' })),
+  installReader
+ });
+ assert.equal(impRes.status, 200);
+ assert.equal(JSON.parse(await impRes.text()).count, 1);
+
+ const emptyImpRes = await handleLocalMuseRoute(
+  new Request('http://127.0.0.1:4174/api/muse/accounts/import', { method: 'POST' }),
+  new URL('http://127.0.0.1:4174/api/muse/accounts/import'),
+  { fetcher: mockFetcher, bodyBuffer: Buffer.from(JSON.stringify({ cookie_header: '' })), installReader }
+ );
+ assert.equal(emptyImpRes.status, 400);
+
+ // Exercise client helpers pointed at mocked local bridge fetch
+ try {
+  globalThis.location = { hostname: '127.0.0.1' };
+  const localBridgeFetch = async (path, init = {}) => {
+   const fullUrl = new URL(path.replace(/^\.\//, '/'), 'http://127.0.0.1:4174').toString();
+   const buf = init.body ? Buffer.from(String(init.body), 'utf8') : null;
+   return await handleLocalMuseRoute(new Request(fullUrl, init), new URL(fullUrl), {
+    fetcher: mockFetcher,
+    bodyBuffer: buf,
+    installReader
+   });
+  };
+  const lw = await startMuseLoginWindow({}, '', { label: '新小号' }, { fetcher: localBridgeFetch });
+  assert.equal(lw.id, 'lw_1');
+  const lwDone = await pollMuseLoginWindow({}, '', lw.id, { fetcher: localBridgeFetch });
+  assert.equal(lwDone.status, 'done');
+  const syncOk = await runMuseAccountAction({}, '', 'acc_1', 'sync-protocol', undefined, { fetcher: localBridgeFetch });
+  assert.equal(syncOk.ok, true);
+  const net = await checkMuseProtocolNetwork({}, '', true, { fetcher: localBridgeFetch });
+  assert.equal(net.ok, true);
+  assert.match(net.route, /7897/);
+  await runMuseAccountAction({}, '', 'acc_1', 'update', { enabled: false }, { fetcher: localBridgeFetch });
+  await runMuseAccountAction({}, '', 'acc_1', 'delete', undefined, { fetcher: localBridgeFetch });
+  assert.ok(calls.some((c) => c.url.endsWith('/admin/protocol/sync') && c.headers.Authorization === `Bearer ${secretPoolKey}`));
+ } finally {
+  if (prevLoc === undefined) delete globalThis.location;
+  else globalThis.location = prevLoc;
+ }
 });
